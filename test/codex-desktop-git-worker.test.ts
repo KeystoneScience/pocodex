@@ -86,6 +86,10 @@ describe("DefaultCodexDesktopGitWorkerBridge", () => {
     ]);
     expect(FakeWorker.instances[0]?.options).toMatchObject({
       name: "git",
+      env: {
+        BUILD_FLAVOR: "stable",
+        CODEX_BUILD_NUMBER: "123",
+      },
       workerData: {
         workerId: "git",
         maxLogLevel: "warning",

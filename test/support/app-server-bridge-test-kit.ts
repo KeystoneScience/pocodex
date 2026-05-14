@@ -250,6 +250,11 @@ export function describeAppServerBridge(
 export async function createBridge(
   children: MockChildProcess[],
   options: {
+    codexMetadata?: {
+      version: string;
+      buildFlavor: string;
+      buildNumber: string;
+    };
     codexHomePath?: string;
     persistedAtomRegistryPath?: string;
     workspaceRootRegistryPath?: string;
@@ -279,6 +284,11 @@ export async function createBridge(
   return AppServerBridge.connect({
     appPath: "/Applications/Codex.app",
     codexCliPath: "/tmp/mock-codex",
+    codexMetadata: options.codexMetadata ?? {
+      version: "26.506.31421",
+      buildFlavor: "prod",
+      buildNumber: "2620",
+    },
     cwd: TEST_WORKSPACE_ROOT,
     codexHomePath: options.codexHomePath,
     persistedAtomRegistryPath: options.persistedAtomRegistryPath,

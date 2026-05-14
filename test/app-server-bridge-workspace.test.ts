@@ -277,6 +277,65 @@ describeAppServerBridge(({ children }) => {
     await bridge.close();
   });
 
+  it("searches nearby workspace root picker directories fuzzily", async () => {
+    const tempDirectory = await mkdtemp(join(tmpdir(), "pocodex-workspace-root-picker-"));
+    tempDirs.push(tempDirectory);
+    const fullStackPath = join(tempDirectory, "Ditto", "FullStack");
+    await mkdir(fullStackPath, { recursive: true });
+    await mkdir(join(tempDirectory, "AlphaProject"), { recursive: true });
+    await mkdir(join(tempDirectory, "node_modules", "FullStackIgnored"), { recursive: true });
+
+    const bridge = await createBridge(children);
+
+    await expect(
+      bridge.handleIpcRequest({
+        requestId: "ipc-search-fuzzy",
+        method: "workspace-root-picker/search",
+        params: {
+          query: "flstk",
+          currentPath: tempDirectory,
+        },
+      }),
+    ).resolves.toMatchObject({
+      requestId: "ipc-search-fuzzy",
+      type: "response",
+      resultType: "success",
+      result: {
+        suggestions: expect.arrayContaining([
+          {
+            name: "FullStack",
+            path: fullStackPath,
+          },
+        ]),
+      },
+    });
+
+    await expect(
+      bridge.handleIpcRequest({
+        requestId: "ipc-search-path",
+        method: "workspace-root-picker/search",
+        params: {
+          query: join(tempDirectory, "Di", "Fu"),
+          currentPath: homedir(),
+        },
+      }),
+    ).resolves.toMatchObject({
+      requestId: "ipc-search-path",
+      type: "response",
+      resultType: "success",
+      result: {
+        suggestions: expect.arrayContaining([
+          {
+            name: "FullStack",
+            path: fullStackPath,
+          },
+        ]),
+      },
+    });
+
+    await bridge.close();
+  });
+
   it("rejects invalid workspace root picker paths", async () => {
     const tempDirectory = await mkdtemp(join(tmpdir(), "pocodex-workspace-root-picker-"));
     tempDirs.push(tempDirectory);

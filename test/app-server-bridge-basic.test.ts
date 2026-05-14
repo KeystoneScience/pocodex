@@ -35,6 +35,7 @@ describeAppServerBridge(({ children }) => {
     expect(child).toBeTruthy();
     const written = child?.writes ?? "";
     expect(written).toContain('"method":"initialize"');
+    expect(written).toContain('"version":"26.506.31421"');
     expect(written).toContain('"method":"initialized"');
 
     await bridge.forwardBridgeMessage({
@@ -100,6 +101,156 @@ describeAppServerBridge(({ children }) => {
       env: expect.objectContaining({
         CODEX_HOME: codexHomePath,
       }),
+    });
+
+    await bridge.close();
+  });
+
+  it("passes Codex build metadata through to the spawned app-server", async () => {
+    const bridge = await createBridge(children, {
+      codexMetadata: {
+        version: "26.506.31421",
+        buildFlavor: "prod",
+        buildNumber: "2620",
+      },
+    });
+    const { spawn } = await import("node:child_process");
+
+    expect(vi.mocked(spawn).mock.calls.at(0)?.[2]).toMatchObject({
+      env: expect.objectContaining({
+        BUILD_FLAVOR: "prod",
+        CODEX_BUILD_NUMBER: "2620",
+      }),
+    });
+
+    await bridge.close();
+  });
+
+  it("returns real Codex build metadata for extension-info", async () => {
+    const bridge = await createBridge(children, {
+      codexMetadata: {
+        version: "26.506.31421",
+        buildFlavor: "prod",
+        buildNumber: "2620",
+      },
+    });
+    const emittedMessages: unknown[] = [];
+    bridge.on("bridge_message", (message) => {
+      emittedMessages.push(message);
+    });
+
+    await bridge.forwardBridgeMessage({
+      type: "fetch",
+      requestId: "extension-info",
+      method: "POST",
+      url: "vscode://codex/extension-info",
+    });
+
+    await waitForCondition(() => getFetchResponse(emittedMessages, "extension-info") != null);
+
+    expect(getFetchJsonBody(emittedMessages, "extension-info")).toEqual({
+      appName: "Codex",
+      version: "26.506.31421",
+      buildFlavor: "prod",
+      buildNumber: "2620",
+    });
+
+    await bridge.close();
+  });
+
+  it("lists host automations from Codex home", async () => {
+    const codexHomePath = await mkdtemp(join(tmpdir(), "pocodex-codex-home-"));
+    tempDirs.push(codexHomePath);
+    await mkdir(join(codexHomePath, "automations", "daily-brief"), { recursive: true });
+    await writeFile(
+      join(codexHomePath, "automations", "daily-brief", "automation.toml"),
+      [
+        "version = 1",
+        'id = "daily-brief"',
+        'kind = "cron"',
+        'name = "Daily Brief"',
+        'prompt = "Summarize the day."',
+        'status = "ACTIVE"',
+        'rrule = "FREQ=DAILY;BYHOUR=7;BYMINUTE=0"',
+        'model = "gpt-5.5"',
+        'reasoning_effort = "xhigh"',
+        'execution_environment = "local"',
+        'cwds = ["/tmp/project"]',
+        "created_at = 1777491041403",
+        "updated_at = 1778086962068",
+      ].join("\n"),
+    );
+    await mkdir(join(codexHomePath, "automations", "thread-reminder"), { recursive: true });
+    await writeFile(
+      join(codexHomePath, "automations", "thread-reminder", "automation.toml"),
+      [
+        "version = 1",
+        'id = "thread-reminder"',
+        'kind = "heartbeat"',
+        'name = "Thread Reminder"',
+        'prompt = "Check this thread once."',
+        'status = "INACTIVE"',
+        'rrule = "FREQ=DAILY;COUNT=1;BYHOUR=14;BYMINUTE=0"',
+        'target_thread_id = "thread-123"',
+        "created_at = 1778697763127",
+        "updated_at = 1778702479431",
+      ].join("\n"),
+    );
+
+    const bridge = await createBridge(children, { codexHomePath });
+    const emittedMessages: unknown[] = [];
+    bridge.on("bridge_message", (message) => {
+      emittedMessages.push(message);
+    });
+
+    await bridge.forwardBridgeMessage({
+      type: "fetch",
+      requestId: "list-automations",
+      method: "POST",
+      url: "vscode://codex/list-automations",
+    });
+
+    await waitForCondition(() => getFetchResponse(emittedMessages, "list-automations") != null);
+
+    expect(getFetchJsonBody(emittedMessages, "list-automations")).toEqual({
+      items: [
+        {
+          id: "thread-reminder",
+          kind: "heartbeat",
+          name: "Thread Reminder",
+          prompt: "Check this thread once.",
+          status: "PAUSED",
+          rrule: "FREQ=DAILY;COUNT=1;BYHOUR=14;BYMINUTE=0",
+          cwds: [],
+          model: null,
+          reasoningEffort: null,
+          executionEnvironment: null,
+          localEnvironmentConfigPath: null,
+          targetThreadId: "thread-123",
+          nextRunAt: null,
+          lastRunAt: null,
+          createdAt: 1778697763127,
+          updatedAt: 1778702479431,
+        },
+        {
+          id: "daily-brief",
+          kind: "cron",
+          name: "Daily Brief",
+          prompt: "Summarize the day.",
+          status: "ACTIVE",
+          rrule: "FREQ=DAILY;BYHOUR=7;BYMINUTE=0",
+          cwds: ["/tmp/project"],
+          model: "gpt-5.5",
+          reasoningEffort: "xhigh",
+          executionEnvironment: "local",
+          localEnvironmentConfigPath: null,
+          targetThreadId: null,
+          nextRunAt: null,
+          lastRunAt: null,
+          createdAt: 1777491041403,
+          updatedAt: 1778086962068,
+        },
+      ],
     });
 
     await bridge.close();

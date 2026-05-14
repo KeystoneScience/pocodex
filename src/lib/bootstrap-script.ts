@@ -39,11 +39,20 @@ function bootstrapPocodexInBrowser(config: BootstrapScriptConfig): void {
     path: string;
   };
 
+  type WorkspaceRootPickerSuggestion = {
+    name: string;
+    path: string;
+  };
+
   type WorkspaceRootPickerListResult = {
     currentPath: string;
     parentPath: string | null;
     homePath: string;
     entries: WorkspaceRootPickerEntry[];
+  };
+
+  type WorkspaceRootPickerSearchResult = {
+    suggestions: WorkspaceRootPickerSuggestion[];
   };
 
   type WorkspaceRootPickerState = {
@@ -52,9 +61,14 @@ function bootstrapPocodexInBrowser(config: BootstrapScriptConfig): void {
     parentPath: string | null;
     entries: WorkspaceRootPickerEntry[];
     pathInputValue: string;
+    suggestions: WorkspaceRootPickerSuggestion[];
     errorMessage: string | null;
+    searchErrorMessage: string | null;
+    searchResultQuery: string | null;
+    activeSuggestionIndex: number;
     hasOpenedPath: boolean;
     isLoading: boolean;
+    isSearching: boolean;
     isCreatingDirectory: boolean;
     isCancelling: boolean;
     isConfirming: boolean;
@@ -93,6 +107,49 @@ function bootstrapPocodexInBrowser(config: BootstrapScriptConfig): void {
     | { ok: true }
     | { ok: false; reason: "unauthorized" | "unavailable" };
 
+  type AppServerSwitcherState = {
+    activeSshAlias: string | null;
+    errorMessage: string | null;
+    hasLoadedSshAliases: boolean;
+    isChecking: boolean;
+    isLoadingSshAliases: boolean;
+    sshAliasErrorMessage: string | null;
+    sshAliases: SshAppServerAlias[];
+    statusMessage: string | null;
+    targets: AppServerTarget[];
+    tokenInputValue: string;
+    urlInputValue: string;
+  };
+
+  type AppServerTarget = {
+    lastUsedAt: number;
+    url: string;
+  };
+
+  type AppServerSwitchTarget = {
+    appUrl: string;
+    displayUrl: string;
+    sessionCheckUrl: string;
+  };
+
+  type SshAppServerAlias = {
+    alias: string;
+    display: string;
+    hostName: string | null;
+    port: string | null;
+    user: string | null;
+  };
+
+  type SshAppServerConnection = {
+    alias: string;
+    appUrl: string;
+    displayUrl: string;
+    launcherAvailable: boolean;
+    localPort: number;
+    remotePort: number;
+    token: string;
+  };
+
   type WorkerMessageListener = (message: unknown) => void;
 
   interface ElectronBridge {
@@ -118,11 +175,16 @@ function bootstrapPocodexInBrowser(config: BootstrapScriptConfig): void {
   const LOCAL_HOST_ID = "local";
   const LOCAL_THREAD_ROUTE_PREFIX = "/local/";
   const LAST_ROUTE_STORAGE_KEY = "__pocodex_last_route";
+  const APP_SERVER_TARGETS_STORAGE_KEY = "__pocodex_app_server_targets";
   const ENTER_BEHAVIOR_ATOM_KEY = "enter-behavior";
   const ENTER_BEHAVIOR_NEWLINE = "newline";
   const SOFT_KEYBOARD_INSET_THRESHOLD_PX = 120;
   const RETRY_DELAYS_MS = [1000, 2000, 5000, 8000, 12000] as const;
+  const APP_SERVER_CHECK_PATH = "/app-server-check";
   const SESSION_CHECK_PATH = "/session-check";
+  const SSH_APP_SERVER_ALIASES_PATH = "/ssh-app-server-aliases";
+  const SSH_APP_SERVER_CONNECT_PATH = "/ssh-app-server-connect";
+  const SSH_APP_SERVER_LAUNCHER_PATH = "/ssh-app-server-launcher";
   const MOBILE_SIDEBAR_MEDIA_QUERY = "(max-width: 640px), (pointer: coarse) and (max-width: 900px)";
   const LEGACY_SIDEBAR_MODE_PERSISTED_ATOM_KEY = "pocodex-sidebar-mode";
   const SIDEBAR_INTERACTION_ARM_MS = 500;
@@ -131,6 +193,9 @@ function bootstrapPocodexInBrowser(config: BootstrapScriptConfig): void {
   const HEARTBEAT_MONITOR_INTERVAL_MS = 5_000;
   const WAKE_GRACE_PERIOD_MS = 10_000;
   const RELOAD_REQUIRED_FAILURE_COUNT = 6;
+  const APP_SERVER_TARGET_LIMIT = 6;
+  const WORKSPACE_ROOT_PICKER_SEARCH_DEBOUNCE_MS = 160;
+  const WORKSPACE_ROOT_PICKER_SEARCH_MIN_QUERY_LENGTH = 2;
   const NON_TEXT_INPUT_TYPES = new Set([
     "button",
     "checkbox",
@@ -151,6 +216,7 @@ function bootstrapPocodexInBrowser(config: BootstrapScriptConfig): void {
   const statusHost = document.createElement("div");
   const importHost = document.createElement("div");
   const workspaceRootPickerHost = document.createElement("div");
+  const appServerSwitcherHost = document.createElement("div");
 
   let socket: WebSocket | null = null;
   let isConnecting = false;
@@ -185,6 +251,9 @@ function bootstrapPocodexInBrowser(config: BootstrapScriptConfig): void {
   let pendingSidebarModeTargetUntil = 0;
   let settingsShellObserver: MutationObserver | null = null;
   let workspaceRootPickerState: WorkspaceRootPickerState | null = null;
+  let appServerSwitcherState: AppServerSwitcherState | null = null;
+  let workspaceRootPickerSearchTimer: number | null = null;
+  let nextWorkspaceRootPickerSearchId = 0;
 
   toastHost.id = "pocodex-toast-host";
   statusHost.id = "pocodex-status-host";
@@ -192,6 +261,7 @@ function bootstrapPocodexInBrowser(config: BootstrapScriptConfig): void {
   importHost.hidden = true;
   workspaceRootPickerHost.id = "pocodex-workspace-root-picker-host";
   workspaceRootPickerHost.hidden = true;
+  appServerSwitcherHost.id = "pocodex-app-server-switcher-host";
   document.documentElement.dataset.pocodex = "true";
   getStoredToken();
   restoreStoredRouteIfNeeded();
@@ -204,6 +274,8 @@ function bootstrapPocodexInBrowser(config: BootstrapScriptConfig): void {
     ensureStylesheetLink(config.stylesheetHref);
     ensureHostAttached(toastHost);
     ensureHostAttached(statusHost);
+    ensureHostAttached(appServerSwitcherHost);
+    renderAppServerSwitcher();
     ensureHostAttached(workspaceRootPickerHost);
     installRouteDatasetSync();
     installSettingsShellObserver();
@@ -353,6 +425,688 @@ function bootstrapPocodexInBrowser(config: BootstrapScriptConfig): void {
     window.setTimeout(() => {
       toast.remove();
     }, 5000);
+  }
+
+  function renderAppServerSwitcher(): void {
+    ensureHostAttached(appServerSwitcherHost);
+    appServerSwitcherHost.replaceChildren();
+
+    const trigger = document.createElement("button");
+    trigger.type = "button";
+    trigger.dataset.pocodexAppServerSwitcherButton = "true";
+    trigger.textContent = "App server";
+    trigger.addEventListener("click", () => {
+      openAppServerSwitcher();
+    });
+    appServerSwitcherHost.appendChild(trigger);
+
+    const state = appServerSwitcherState;
+    if (!state) {
+      return;
+    }
+
+    const backdrop = document.createElement("div");
+    backdrop.dataset.pocodexAppServerSwitcherBackdrop = "true";
+
+    const dialog = document.createElement("section");
+    dialog.dataset.pocodexAppServerSwitcherDialog = "true";
+    dialog.setAttribute("aria-modal", "true");
+    dialog.setAttribute("role", "dialog");
+
+    const header = document.createElement("div");
+    header.dataset.pocodexAppServerSwitcherHeader = "true";
+    const title = document.createElement("h2");
+    title.textContent = "App server";
+    const current = document.createElement("p");
+    current.textContent = `Current: ${new URL(window.location.href).origin}`;
+    header.append(title, current);
+
+    const form = document.createElement("div");
+    form.dataset.pocodexAppServerSwitcherForm = "true";
+
+    let feedback: HTMLParagraphElement | null = null;
+    let testButton: HTMLButtonElement | null = null;
+    let switchButton: HTMLButtonElement | null = null;
+    const syncControls = (): void => {
+      const nextState = appServerSwitcherState;
+      if (!nextState) {
+        return;
+      }
+
+      const hasUrl = nextState.urlInputValue.trim().length > 0;
+      if (testButton) {
+        testButton.disabled = nextState.isChecking || !hasUrl;
+      }
+      if (switchButton) {
+        switchButton.disabled = nextState.isChecking || !hasUrl;
+      }
+      if (!feedback) {
+        return;
+      }
+
+      if (nextState.errorMessage) {
+        feedback.dataset.variant = "error";
+        feedback.textContent = nextState.errorMessage;
+      } else if (nextState.statusMessage) {
+        feedback.dataset.variant = "success";
+        feedback.textContent = nextState.statusMessage;
+      } else {
+        delete feedback.dataset.variant;
+        feedback.textContent = "Connect to another Pocodex URL to use that computer's app server.";
+      }
+    };
+
+    const urlLabel = document.createElement("label");
+    urlLabel.textContent = "Server URL";
+    const urlInput = document.createElement("input");
+    urlInput.type = "text";
+    urlInput.placeholder = "http://desktop.local:8788/?token=...";
+    urlInput.value = state.urlInputValue;
+    urlInput.disabled = state.isChecking;
+    urlInput.dataset.pocodexAppServerUrlInput = "true";
+    urlInput.addEventListener("input", () => {
+      if (!appServerSwitcherState) {
+        return;
+      }
+      appServerSwitcherState.urlInputValue = urlInput.value;
+      appServerSwitcherState.errorMessage = null;
+      appServerSwitcherState.statusMessage = null;
+      syncControls();
+    });
+    urlLabel.appendChild(urlInput);
+
+    const tokenLabel = document.createElement("label");
+    tokenLabel.textContent = "Token";
+    const tokenInput = document.createElement("input");
+    tokenInput.type = "password";
+    tokenInput.placeholder = "Optional if included in URL";
+    tokenInput.value = state.tokenInputValue;
+    tokenInput.disabled = state.isChecking;
+    tokenInput.dataset.pocodexAppServerTokenInput = "true";
+    tokenInput.addEventListener("input", () => {
+      if (!appServerSwitcherState) {
+        return;
+      }
+      appServerSwitcherState.tokenInputValue = tokenInput.value;
+      appServerSwitcherState.errorMessage = null;
+      appServerSwitcherState.statusMessage = null;
+      syncControls();
+    });
+    tokenLabel.appendChild(tokenInput);
+
+    form.append(urlLabel, tokenLabel);
+
+    feedback = document.createElement("p");
+    feedback.dataset.pocodexAppServerSwitcherFeedback = "true";
+    if (state.errorMessage) {
+      feedback.dataset.variant = "error";
+      feedback.textContent = state.errorMessage;
+    } else if (state.statusMessage) {
+      feedback.dataset.variant = "success";
+      feedback.textContent = state.statusMessage;
+    } else {
+      feedback.textContent = "Connect to another Pocodex URL to use that computer's app server.";
+    }
+
+    const sshAliases = renderAppServerSwitcherSshAliases(state);
+    const recent = renderAppServerSwitcherRecentTargets(state.targets);
+
+    const footer = document.createElement("div");
+    footer.dataset.pocodexAppServerSwitcherFooter = "true";
+
+    const cancelButton = document.createElement("button");
+    cancelButton.type = "button";
+    cancelButton.textContent = "Cancel";
+    cancelButton.disabled = state.isChecking;
+    cancelButton.dataset.pocodexAppServerSwitcherCancel = "true";
+    cancelButton.addEventListener("click", () => {
+      closeAppServerSwitcher();
+    });
+
+    testButton = document.createElement("button");
+    testButton.type = "button";
+    testButton.textContent = state.isChecking ? "Testing..." : "Test";
+    testButton.disabled = state.isChecking || state.urlInputValue.trim().length === 0;
+    testButton.dataset.pocodexAppServerSwitcherTest = "true";
+    testButton.addEventListener("click", () => {
+      void testAppServerTarget();
+    });
+
+    switchButton = document.createElement("button");
+    switchButton.type = "button";
+    switchButton.textContent = state.isChecking ? "Switching..." : "Switch";
+    switchButton.disabled = state.isChecking || state.urlInputValue.trim().length === 0;
+    switchButton.dataset.pocodexAppServerSwitcherSwitch = "true";
+    switchButton.dataset.variant = "primary";
+    switchButton.addEventListener("click", () => {
+      void switchAppServerTarget();
+    });
+
+    footer.append(cancelButton, testButton, switchButton);
+    dialog.append(header, form, feedback, sshAliases);
+    if (recent) {
+      dialog.appendChild(recent);
+    }
+    dialog.appendChild(footer);
+    backdrop.appendChild(dialog);
+    backdrop.addEventListener("click", (event) => {
+      if (readEventTarget(event) === backdrop && !state.isChecking) {
+        closeAppServerSwitcher();
+      }
+    });
+    appServerSwitcherHost.appendChild(backdrop);
+    syncControls();
+  }
+
+  function renderAppServerSwitcherRecentTargets(targets: AppServerTarget[]): HTMLDivElement | null {
+    const currentOrigin = new URL(window.location.href).origin;
+    const recentTargets = targets.filter((target) => {
+      try {
+        return new URL(target.url).origin !== currentOrigin;
+      } catch {
+        return false;
+      }
+    });
+    if (recentTargets.length === 0) {
+      return null;
+    }
+
+    const section = document.createElement("div");
+    section.dataset.pocodexAppServerSwitcherRecent = "true";
+    const label = document.createElement("p");
+    label.textContent = "Recent";
+    section.appendChild(label);
+
+    for (const target of recentTargets) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.dataset.pocodexAppServerRecentTarget = "true";
+      button.textContent = formatAppServerTargetDisplayUrl(target.url);
+      button.addEventListener("click", () => {
+        appServerSwitcherState = {
+          ...(appServerSwitcherState ?? createAppServerSwitcherState()),
+          errorMessage: null,
+          statusMessage: null,
+          tokenInputValue: "",
+          urlInputValue: target.url,
+        };
+        renderAppServerSwitcher();
+      });
+      section.appendChild(button);
+    }
+
+    return section;
+  }
+
+  function renderAppServerSwitcherSshAliases(state: AppServerSwitcherState): HTMLDetailsElement {
+    const section = document.createElement("details");
+    section.open = true;
+    section.dataset.pocodexAppServerSshAliases = "true";
+
+    const summary = document.createElement("summary");
+    summary.textContent = "SSH aliases";
+    section.appendChild(summary);
+
+    const body = document.createElement("div");
+    body.dataset.pocodexAppServerSshAliasList = "true";
+
+    if (state.isLoadingSshAliases) {
+      const status = document.createElement("p");
+      status.dataset.pocodexAppServerSshAliasStatus = "true";
+      status.textContent = "Loading SSH aliases...";
+      body.appendChild(status);
+    } else if (state.sshAliasErrorMessage) {
+      const status = document.createElement("p");
+      status.dataset.pocodexAppServerSshAliasStatus = "true";
+      status.dataset.variant = "error";
+      status.textContent = state.sshAliasErrorMessage;
+      body.appendChild(status);
+    } else if (state.sshAliases.length === 0) {
+      const status = document.createElement("p");
+      status.dataset.pocodexAppServerSshAliasStatus = "true";
+      status.textContent = "No SSH aliases found in this host's SSH config.";
+      body.appendChild(status);
+    } else {
+      for (const alias of state.sshAliases) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.dataset.pocodexAppServerSshAlias = alias.alias;
+        button.disabled = state.isChecking;
+
+        const name = document.createElement("strong");
+        name.textContent =
+          state.activeSshAlias === alias.alias && state.isChecking
+            ? `Connecting ${alias.alias}...`
+            : alias.alias;
+        const detail = document.createElement("span");
+        detail.textContent = alias.display === alias.alias ? "Use this SSH host" : alias.display;
+        button.append(name, detail);
+        button.addEventListener("click", () => {
+          void connectSshAppServerAlias(alias.alias);
+        });
+        body.appendChild(button);
+      }
+    }
+
+    section.appendChild(body);
+    return section;
+  }
+
+  function openAppServerSwitcher(): void {
+    appServerSwitcherState = createAppServerSwitcherState();
+    renderAppServerSwitcher();
+    void loadSshAppServerAliases();
+  }
+
+  function closeAppServerSwitcher(): void {
+    appServerSwitcherState = null;
+    renderAppServerSwitcher();
+  }
+
+  function createAppServerSwitcherState(): AppServerSwitcherState {
+    return {
+      activeSshAlias: null,
+      errorMessage: null,
+      hasLoadedSshAliases: false,
+      isChecking: false,
+      isLoadingSshAliases: false,
+      sshAliasErrorMessage: null,
+      sshAliases: [],
+      statusMessage: null,
+      targets: readAppServerTargets(),
+      tokenInputValue: "",
+      urlInputValue: "",
+    };
+  }
+
+  async function loadSshAppServerAliases(): Promise<void> {
+    const state = appServerSwitcherState;
+    if (!state || state.isLoadingSshAliases || state.hasLoadedSshAliases) {
+      return;
+    }
+
+    state.isLoadingSshAliases = true;
+    state.sshAliasErrorMessage = null;
+    renderAppServerSwitcher();
+
+    try {
+      const payload = await requestPocodexJson(SSH_APP_SERVER_ALIASES_PATH);
+      if (!isRecord(payload) || payload.ok !== true || !Array.isArray(payload.aliases)) {
+        throw new Error("Unable to read SSH aliases.");
+      }
+
+      const aliases = payload.aliases.flatMap((alias): SshAppServerAlias[] => {
+        if (
+          !isRecord(alias) ||
+          typeof alias.alias !== "string" ||
+          typeof alias.display !== "string"
+        ) {
+          return [];
+        }
+        return [
+          {
+            alias: alias.alias,
+            display: alias.display,
+            hostName: typeof alias.hostName === "string" ? alias.hostName : null,
+            port: typeof alias.port === "string" ? alias.port : null,
+            user: typeof alias.user === "string" ? alias.user : null,
+          },
+        ];
+      });
+
+      if (appServerSwitcherState) {
+        appServerSwitcherState.sshAliases = aliases;
+        appServerSwitcherState.hasLoadedSshAliases = true;
+      }
+    } catch (error) {
+      if (appServerSwitcherState) {
+        appServerSwitcherState.sshAliasErrorMessage = normalizeAppServerSwitcherError(error);
+      }
+    } finally {
+      if (appServerSwitcherState) {
+        appServerSwitcherState.isLoadingSshAliases = false;
+        renderAppServerSwitcher();
+      }
+    }
+  }
+
+  async function connectSshAppServerAlias(alias: string): Promise<void> {
+    const state = appServerSwitcherState;
+    if (!state) {
+      return;
+    }
+
+    state.activeSshAlias = alias;
+    state.isChecking = true;
+    state.errorMessage = null;
+    state.statusMessage = `Connecting ${alias}...`;
+    renderAppServerSwitcher();
+
+    let connection: SshAppServerConnection;
+    try {
+      connection = await requestSshAppServerConnection(alias);
+      writeAppServerTarget(connection.appUrl);
+    } catch (error) {
+      if (appServerSwitcherState) {
+        appServerSwitcherState.activeSshAlias = null;
+        appServerSwitcherState.errorMessage = normalizeAppServerSwitcherError(error);
+        appServerSwitcherState.statusMessage = null;
+        appServerSwitcherState.isChecking = false;
+        renderAppServerSwitcher();
+      }
+      return;
+    }
+
+    let launcherMessage = "";
+    if (connection.launcherAvailable && shouldCreateQuickLaunchApp(alias)) {
+      try {
+        const launcherPath = await createSshAppServerLauncher(alias);
+        launcherMessage = ` Desktop launcher created at ${launcherPath}.`;
+      } catch (error) {
+        launcherMessage = ` Launcher was not created: ${normalizeAppServerSwitcherError(error)}`;
+      }
+    }
+
+    if (appServerSwitcherState) {
+      appServerSwitcherState.statusMessage = `Switching to ${connection.displayUrl}.${launcherMessage}`;
+      appServerSwitcherState.errorMessage = null;
+      renderAppServerSwitcher();
+    }
+
+    window.location.href = connection.appUrl;
+  }
+
+  async function requestSshAppServerConnection(alias: string): Promise<SshAppServerConnection> {
+    const payload = await requestPocodexJson(SSH_APP_SERVER_CONNECT_PATH, {
+      alias,
+    });
+    if (!isRecord(payload) || payload.ok !== true || !isRecord(payload.connection)) {
+      throw new Error("Unable to connect that SSH alias.");
+    }
+
+    const { connection } = payload;
+    if (
+      typeof connection.alias !== "string" ||
+      typeof connection.appUrl !== "string" ||
+      typeof connection.displayUrl !== "string" ||
+      typeof connection.launcherAvailable !== "boolean" ||
+      typeof connection.localPort !== "number" ||
+      typeof connection.remotePort !== "number" ||
+      typeof connection.token !== "string"
+    ) {
+      throw new Error("That SSH alias returned an invalid Pocodex connection.");
+    }
+
+    return {
+      alias: connection.alias,
+      appUrl: connection.appUrl,
+      displayUrl: connection.displayUrl,
+      launcherAvailable: connection.launcherAvailable,
+      localPort: connection.localPort,
+      remotePort: connection.remotePort,
+      token: connection.token,
+    };
+  }
+
+  async function createSshAppServerLauncher(alias: string): Promise<string> {
+    const payload = await requestPocodexJson(SSH_APP_SERVER_LAUNCHER_PATH, {
+      alias,
+    });
+    if (!isRecord(payload) || payload.ok !== true || !isRecord(payload.launcher)) {
+      throw new Error("Unable to create the launcher app.");
+    }
+    const appPath = payload.launcher.appPath;
+    if (typeof appPath !== "string") {
+      throw new Error("The launcher app was created but no path was returned.");
+    }
+    return appPath;
+  }
+
+  function shouldCreateQuickLaunchApp(alias: string): boolean {
+    if (typeof window.confirm !== "function") {
+      return false;
+    }
+    return window.confirm(`Create a Desktop quick launch app for ${alias} Pocodex?`);
+  }
+
+  async function testAppServerTarget(): Promise<AppServerSwitchTarget | null> {
+    const state = appServerSwitcherState;
+    if (!state) {
+      return null;
+    }
+
+    let target: AppServerSwitchTarget;
+    try {
+      target = buildAppServerSwitchTarget(state.urlInputValue, state.tokenInputValue);
+    } catch (error) {
+      state.errorMessage = normalizeAppServerSwitcherError(error);
+      state.statusMessage = null;
+      renderAppServerSwitcher();
+      return null;
+    }
+
+    state.isChecking = true;
+    state.errorMessage = null;
+    state.statusMessage = null;
+    renderAppServerSwitcher();
+
+    try {
+      await validateAppServerTarget(target);
+      writeAppServerTarget(target.appUrl);
+      if (!appServerSwitcherState) {
+        return target;
+      }
+      appServerSwitcherState.targets = readAppServerTargets();
+      appServerSwitcherState.statusMessage = `Ready: ${target.displayUrl}`;
+      appServerSwitcherState.errorMessage = null;
+      return target;
+    } catch (error) {
+      if (appServerSwitcherState) {
+        appServerSwitcherState.errorMessage = normalizeAppServerSwitcherError(error);
+        appServerSwitcherState.statusMessage = null;
+      }
+      return null;
+    } finally {
+      if (appServerSwitcherState) {
+        appServerSwitcherState.isChecking = false;
+        renderAppServerSwitcher();
+      }
+    }
+  }
+
+  async function switchAppServerTarget(): Promise<void> {
+    const target = await testAppServerTarget();
+    if (!target || !appServerSwitcherState) {
+      return;
+    }
+
+    appServerSwitcherState.isChecking = true;
+    appServerSwitcherState.statusMessage = "Switching...";
+    renderAppServerSwitcher();
+    window.location.href = target.appUrl;
+  }
+
+  function buildAppServerSwitchTarget(rawUrl: string, rawToken: string): AppServerSwitchTarget {
+    const trimmedUrl = rawUrl.trim();
+    if (!trimmedUrl) {
+      throw new Error("Enter a Pocodex URL.");
+    }
+
+    const urlWithProtocol = /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmedUrl)
+      ? trimmedUrl
+      : `http://${trimmedUrl}`;
+    const parsed = new URL(urlWithProtocol);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      throw new Error("Use an http or https Pocodex URL.");
+    }
+
+    const token = rawToken.trim();
+    const appUrl = new URL("/", parsed.origin);
+    const existingToken = parsed.searchParams.get("token")?.trim();
+    if (token) {
+      appUrl.searchParams.set("token", token);
+    } else if (existingToken) {
+      appUrl.searchParams.set("token", existingToken);
+    }
+
+    const sessionCheckUrl = new URL("/session-check", parsed.origin);
+    const appToken = appUrl.searchParams.get("token")?.trim();
+    if (appToken) {
+      sessionCheckUrl.searchParams.set("token", appToken);
+    }
+
+    return {
+      appUrl: appUrl.toString(),
+      displayUrl: formatAppServerTargetDisplayUrl(appUrl.toString()),
+      sessionCheckUrl: sessionCheckUrl.toString(),
+    };
+  }
+
+  async function validateAppServerTarget(target: AppServerSwitchTarget): Promise<void> {
+    const response = await window.fetch(getAppServerCheckUrl(target.sessionCheckUrl), {
+      cache: "no-store",
+      credentials: "same-origin",
+    });
+
+    let payload: unknown = null;
+    try {
+      payload = await response.json();
+    } catch {
+      // Non-JSON responses are handled by the generic status checks below.
+    }
+
+    if (response.status === 401) {
+      if (isRecord(payload) && typeof payload.error === "string") {
+        throw new Error(payload.error);
+      }
+      throw new Error("That server rejected the token.");
+    }
+
+    if (!response.ok) {
+      if (isRecord(payload) && typeof payload.error === "string") {
+        throw new Error(payload.error);
+      }
+      throw new Error(`That server returned ${response.status}.`);
+    }
+
+    if (!isRecord(payload) || payload.ok !== true) {
+      throw new Error("That URL did not answer like a Pocodex server.");
+    }
+  }
+
+  function getAppServerCheckUrl(sessionCheckUrl: string): string {
+    const url = new URL(APP_SERVER_CHECK_PATH, window.location.href);
+    url.searchParams.set("url", sessionCheckUrl);
+    const token = getStoredToken();
+    if (token) {
+      url.searchParams.set("token", token);
+    }
+    return `${url.pathname}${url.search}`;
+  }
+
+  async function requestPocodexJson(pathname: string, body?: unknown): Promise<unknown> {
+    const url = new URL(pathname, window.location.href);
+    const token = getStoredToken();
+    if (token) {
+      url.searchParams.set("token", token);
+    }
+
+    const response = await window.fetch(`${url.pathname}${url.search}`, {
+      body: body === undefined ? undefined : JSON.stringify(body),
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: body === undefined ? undefined : { "content-type": "application/json" },
+      method: body === undefined ? "GET" : "POST",
+    });
+
+    let payload: unknown = null;
+    try {
+      payload = await response.json();
+    } catch {
+      // The status-specific handling below will produce a useful message.
+    }
+
+    if (!response.ok) {
+      if (isRecord(payload) && typeof payload.error === "string") {
+        throw new Error(payload.error);
+      }
+      throw new Error(`Pocodex returned ${response.status}.`);
+    }
+
+    return payload;
+  }
+
+  function readAppServerTargets(): AppServerTarget[] {
+    const storage = getStorage("localStorage");
+    const raw = storage?.getItem(APP_SERVER_TARGETS_STORAGE_KEY);
+    if (!raw) {
+      return [];
+    }
+
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (!Array.isArray(parsed)) {
+        return [];
+      }
+      return parsed
+        .flatMap((target): AppServerTarget[] => {
+          if (
+            !isRecord(target) ||
+            typeof target.url !== "string" ||
+            typeof target.lastUsedAt !== "number"
+          ) {
+            return [];
+          }
+          try {
+            return [
+              {
+                lastUsedAt: target.lastUsedAt,
+                url: new URL(target.url).toString(),
+              },
+            ];
+          } catch {
+            return [];
+          }
+        })
+        .sort((left, right) => right.lastUsedAt - left.lastUsedAt)
+        .slice(0, APP_SERVER_TARGET_LIMIT);
+    } catch {
+      return [];
+    }
+  }
+
+  function writeAppServerTarget(url: string): void {
+    const storage = getStorage("localStorage");
+    if (!storage) {
+      return;
+    }
+
+    const normalizedUrl = new URL(url).toString();
+    const nextTargets = [
+      {
+        lastUsedAt: Date.now(),
+        url: normalizedUrl,
+      },
+      ...readAppServerTargets().filter((target) => target.url !== normalizedUrl),
+    ].slice(0, APP_SERVER_TARGET_LIMIT);
+    storage.setItem(APP_SERVER_TARGETS_STORAGE_KEY, JSON.stringify(nextTargets));
+  }
+
+  function formatAppServerTargetDisplayUrl(url: string): string {
+    try {
+      const parsed = new URL(url);
+      parsed.searchParams.delete("token");
+      parsed.pathname = "/";
+      parsed.hash = "";
+      const displayUrl = parsed.toString();
+      return displayUrl.endsWith("/") ? displayUrl.slice(0, -1) : displayUrl;
+    } catch {
+      return url;
+    }
+  }
+
+  function normalizeAppServerSwitcherError(error: unknown): string {
+    return error instanceof Error ? error.message : "Failed to reach that app server.";
   }
 
   function setConnectionStatus(message: string, options: ConnectionStatusOptions = {}): void {
@@ -1106,9 +1860,14 @@ function bootstrapPocodexInBrowser(config: BootstrapScriptConfig): void {
       parentPath: null,
       entries: [],
       pathInputValue: initialPath,
+      suggestions: [],
       errorMessage: null,
+      searchErrorMessage: null,
+      searchResultQuery: null,
+      activeSuggestionIndex: -1,
       hasOpenedPath: false,
       isLoading: true,
+      isSearching: false,
       isCreatingDirectory: false,
       isCancelling: false,
       isConfirming: false,
@@ -1118,12 +1877,13 @@ function bootstrapPocodexInBrowser(config: BootstrapScriptConfig): void {
   }
 
   function closeWorkspaceRootPicker(): void {
+    clearWorkspaceRootPickerSearchTimer();
     workspaceRootPickerState = null;
     workspaceRootPickerHost.hidden = true;
     workspaceRootPickerHost.replaceChildren();
   }
 
-  function renderWorkspaceRootPicker(): void {
+  function renderWorkspaceRootPicker(options: { restorePathInputFocus?: boolean } = {}): void {
     const state = workspaceRootPickerState;
     if (!state) {
       closeWorkspaceRootPicker();
@@ -1172,6 +1932,15 @@ function bootstrapPocodexInBrowser(config: BootstrapScriptConfig): void {
     pathInput.disabled = isBusy;
     pathInput.dataset.pocodexWorkspaceRootPickerPathInput = "true";
 
+    const pathField = document.createElement("div");
+    pathField.dataset.pocodexWorkspaceRootPickerPathField = "true";
+    pathField.appendChild(pathInput);
+
+    const suggestionBox = renderWorkspaceRootPickerSuggestions(state);
+    if (suggestionBox) {
+      pathField.appendChild(suggestionBox);
+    }
+
     const openButton = document.createElement("button");
     openButton.type = "button";
     openButton.dataset.pocodexWorkspaceRootPickerOpenButton = "true";
@@ -1206,18 +1975,59 @@ function bootstrapPocodexInBrowser(config: BootstrapScriptConfig): void {
         return;
       }
       workspaceRootPickerState.pathInputValue = pathInput.value;
+      workspaceRootPickerState.suggestions = [];
+      workspaceRootPickerState.searchErrorMessage = null;
+      workspaceRootPickerState.searchResultQuery = null;
+      workspaceRootPickerState.activeSuggestionIndex = -1;
       syncPathActionButtons();
+      scheduleWorkspaceRootPickerSearch();
+      renderWorkspaceRootPicker({ restorePathInputFocus: true });
     });
     pathInput.addEventListener("keydown", (event) => {
-      if (readEventKey(event) !== "Enter") {
+      const key = readEventKey(event);
+      if (key === "ArrowDown" || key === "ArrowUp") {
+        if (!workspaceRootPickerState || workspaceRootPickerState.suggestions.length === 0) {
+          return;
+        }
+        event.preventDefault();
+        const direction = key === "ArrowDown" ? 1 : -1;
+        const suggestionCount = workspaceRootPickerState.suggestions.length;
+        workspaceRootPickerState.activeSuggestionIndex =
+          (workspaceRootPickerState.activeSuggestionIndex + direction + suggestionCount) %
+          suggestionCount;
+        renderWorkspaceRootPicker({ restorePathInputFocus: true });
+        return;
+      }
+      if (key === "Escape") {
+        if (!workspaceRootPickerState || workspaceRootPickerState.suggestions.length === 0) {
+          return;
+        }
+        event.preventDefault();
+        workspaceRootPickerState.suggestions = [];
+        workspaceRootPickerState.searchErrorMessage = null;
+        workspaceRootPickerState.searchResultQuery = null;
+        workspaceRootPickerState.activeSuggestionIndex = -1;
+        renderWorkspaceRootPicker({ restorePathInputFocus: true });
+        return;
+      }
+      if (key !== "Enter") {
         return;
       }
       event.preventDefault();
+      const currentState = workspaceRootPickerState;
+      const activeSuggestion =
+        currentState && currentState.activeSuggestionIndex >= 0
+          ? currentState.suggestions[currentState.activeSuggestionIndex]
+          : null;
+      if (activeSuggestion) {
+        void selectWorkspaceRootPickerSuggestion(activeSuggestion.path);
+        return;
+      }
       void submitWorkspaceRootPickerPathInput();
     });
     syncPathActionButtons();
 
-    pathLabel.appendChild(pathInput);
+    pathLabel.appendChild(pathField);
     pathForm.append(pathLabel, openButton, newFolderButton);
 
     const content = document.createElement("div");
@@ -1317,6 +2127,91 @@ function bootstrapPocodexInBrowser(config: BootstrapScriptConfig): void {
     });
 
     workspaceRootPickerHost.appendChild(backdrop);
+    if (options.restorePathInputFocus) {
+      focusWorkspaceRootPickerPathInput(pathInput);
+    }
+  }
+
+  function renderWorkspaceRootPickerSuggestions(
+    state: WorkspaceRootPickerState,
+  ): HTMLDivElement | null {
+    const trimmedQuery = state.pathInputValue.trim();
+    const shouldShow =
+      state.isSearching ||
+      state.suggestions.length > 0 ||
+      state.searchErrorMessage !== null ||
+      (state.searchResultQuery === trimmedQuery &&
+        trimmedQuery.length >= WORKSPACE_ROOT_PICKER_SEARCH_MIN_QUERY_LENGTH);
+    if (!shouldShow) {
+      return null;
+    }
+
+    const box = document.createElement("div");
+    box.dataset.pocodexWorkspaceRootPickerSuggestions = "true";
+
+    if (state.isSearching) {
+      const searching = document.createElement("p");
+      searching.dataset.pocodexWorkspaceRootPickerSuggestionStatus = "true";
+      searching.textContent = "Searching folders...";
+      box.appendChild(searching);
+      return box;
+    }
+
+    if (state.searchErrorMessage) {
+      const error = document.createElement("p");
+      error.dataset.pocodexWorkspaceRootPickerSuggestionStatus = "true";
+      error.dataset.variant = "error";
+      error.textContent = state.searchErrorMessage;
+      box.appendChild(error);
+      return box;
+    }
+
+    if (state.suggestions.length === 0) {
+      const empty = document.createElement("p");
+      empty.dataset.pocodexWorkspaceRootPickerSuggestionStatus = "true";
+      empty.textContent = "No matching folders found nearby.";
+      box.appendChild(empty);
+      return box;
+    }
+
+    for (const [index, suggestion] of state.suggestions.entries()) {
+      const option = document.createElement("button");
+      option.type = "button";
+      option.dataset.pocodexWorkspaceRootPickerSuggestion = "true";
+      option.dataset.pocodexWorkspaceRootPickerSuggestionPath = suggestion.path;
+      if (index === state.activeSuggestionIndex) {
+        option.dataset.active = "true";
+      }
+
+      const name = document.createElement("strong");
+      name.dataset.pocodexWorkspaceRootPickerSuggestionName = "true";
+      name.textContent = suggestion.name;
+
+      const path = document.createElement("span");
+      path.dataset.pocodexWorkspaceRootPickerSuggestionPathLabel = "true";
+      path.textContent = formatDesktopImportPath(suggestion.path);
+
+      option.append(name, path);
+      option.addEventListener("click", () => {
+        void selectWorkspaceRootPickerSuggestion(suggestion.path);
+      });
+      box.appendChild(option);
+    }
+
+    return box;
+  }
+
+  function focusWorkspaceRootPickerPathInput(pathInput: HTMLInputElement): void {
+    const focus = (pathInput as { focus?: () => void }).focus;
+    if (typeof focus === "function") {
+      focus.call(pathInput);
+    }
+    try {
+      const cursorPosition = pathInput.value.length;
+      pathInput.setSelectionRange(cursorPosition, cursorPosition);
+    } catch {
+      // Some browser-like test environments do not implement selection APIs.
+    }
   }
 
   async function submitWorkspaceRootPickerPathInput(): Promise<void> {
@@ -1325,7 +2220,114 @@ function bootstrapPocodexInBrowser(config: BootstrapScriptConfig): void {
       return;
     }
 
+    clearWorkspaceRootPickerSearchTimer();
     await loadWorkspaceRootPickerPath(state.pathInputValue);
+  }
+
+  function scheduleWorkspaceRootPickerSearch(): void {
+    const state = workspaceRootPickerState;
+    if (!state) {
+      return;
+    }
+
+    clearWorkspaceRootPickerSearchTimer();
+    const query = state.pathInputValue.trim();
+    if (
+      query.length < WORKSPACE_ROOT_PICKER_SEARCH_MIN_QUERY_LENGTH ||
+      query === state.currentPath
+    ) {
+      state.isSearching = false;
+      state.searchResultQuery =
+        query.length >= WORKSPACE_ROOT_PICKER_SEARCH_MIN_QUERY_LENGTH ? query : null;
+      return;
+    }
+
+    workspaceRootPickerSearchTimer = window.setTimeout(() => {
+      workspaceRootPickerSearchTimer = null;
+      void runWorkspaceRootPickerSearch(query, state.currentPath);
+    }, WORKSPACE_ROOT_PICKER_SEARCH_DEBOUNCE_MS);
+  }
+
+  function clearWorkspaceRootPickerSearchTimer(): void {
+    if (workspaceRootPickerSearchTimer === null) {
+      return;
+    }
+    window.clearTimeout(workspaceRootPickerSearchTimer);
+    workspaceRootPickerSearchTimer = null;
+  }
+
+  async function runWorkspaceRootPickerSearch(query: string, currentPath: string): Promise<void> {
+    if (!workspaceRootPickerState || workspaceRootPickerState.pathInputValue.trim() !== query) {
+      return;
+    }
+
+    const searchId = ++nextWorkspaceRootPickerSearchId;
+    workspaceRootPickerState.isSearching = true;
+    workspaceRootPickerState.searchErrorMessage = null;
+    workspaceRootPickerState.searchResultQuery = query;
+    renderWorkspaceRootPicker({ restorePathInputFocus: true });
+
+    try {
+      const result = await callPocodexIpc("workspace-root-picker/search", {
+        query,
+        currentPath,
+      });
+      if (!isWorkspaceRootPickerSearchResult(result)) {
+        throw new Error("Pocodex returned invalid folder suggestions.");
+      }
+      if (
+        !workspaceRootPickerState ||
+        workspaceRootPickerState.pathInputValue.trim() !== query ||
+        searchId !== nextWorkspaceRootPickerSearchId
+      ) {
+        return;
+      }
+
+      workspaceRootPickerState.suggestions = result.suggestions.filter(
+        (suggestion) => suggestion.path !== workspaceRootPickerState?.currentPath,
+      );
+      workspaceRootPickerState.searchErrorMessage = null;
+      workspaceRootPickerState.searchResultQuery = query;
+      workspaceRootPickerState.activeSuggestionIndex = -1;
+    } catch (error) {
+      if (
+        !workspaceRootPickerState ||
+        workspaceRootPickerState.pathInputValue.trim() !== query ||
+        searchId !== nextWorkspaceRootPickerSearchId
+      ) {
+        return;
+      }
+      workspaceRootPickerState.suggestions = [];
+      workspaceRootPickerState.searchErrorMessage =
+        error instanceof Error ? error.message : "Failed to search folders.";
+      workspaceRootPickerState.searchResultQuery = query;
+      workspaceRootPickerState.activeSuggestionIndex = -1;
+    } finally {
+      if (
+        workspaceRootPickerState &&
+        workspaceRootPickerState.pathInputValue.trim() === query &&
+        searchId === nextWorkspaceRootPickerSearchId
+      ) {
+        workspaceRootPickerState.isSearching = false;
+        renderWorkspaceRootPicker({ restorePathInputFocus: true });
+      }
+    }
+  }
+
+  async function selectWorkspaceRootPickerSuggestion(path: string): Promise<void> {
+    const state = workspaceRootPickerState;
+    if (!state) {
+      return;
+    }
+
+    clearWorkspaceRootPickerSearchTimer();
+    state.pathInputValue = path;
+    state.suggestions = [];
+    state.searchErrorMessage = null;
+    state.searchResultQuery = null;
+    state.activeSuggestionIndex = -1;
+    renderWorkspaceRootPicker({ restorePathInputFocus: true });
+    await loadWorkspaceRootPickerPath(path);
   }
 
   async function loadWorkspaceRootPickerPath(path: string): Promise<void> {
@@ -1333,8 +2335,13 @@ function bootstrapPocodexInBrowser(config: BootstrapScriptConfig): void {
       return;
     }
 
+    clearWorkspaceRootPickerSearchTimer();
     workspaceRootPickerState.isLoading = true;
     workspaceRootPickerState.errorMessage = null;
+    workspaceRootPickerState.suggestions = [];
+    workspaceRootPickerState.searchErrorMessage = null;
+    workspaceRootPickerState.searchResultQuery = null;
+    workspaceRootPickerState.activeSuggestionIndex = -1;
     renderWorkspaceRootPicker();
 
     try {
@@ -1352,7 +2359,11 @@ function bootstrapPocodexInBrowser(config: BootstrapScriptConfig): void {
       workspaceRootPickerState.parentPath = result.parentPath;
       workspaceRootPickerState.entries = result.entries;
       workspaceRootPickerState.pathInputValue = result.currentPath;
+      workspaceRootPickerState.suggestions = [];
       workspaceRootPickerState.errorMessage = null;
+      workspaceRootPickerState.searchErrorMessage = null;
+      workspaceRootPickerState.searchResultQuery = null;
+      workspaceRootPickerState.activeSuggestionIndex = -1;
       workspaceRootPickerState.hasOpenedPath = true;
     } catch (error) {
       if (!workspaceRootPickerState) {
@@ -2043,6 +3054,21 @@ function bootstrapPocodexInBrowser(config: BootstrapScriptConfig): void {
       value.entries.every(
         (entry) =>
           isRecord(entry) && typeof entry.name === "string" && typeof entry.path === "string",
+      )
+    );
+  }
+
+  function isWorkspaceRootPickerSearchResult(
+    value: unknown,
+  ): value is WorkspaceRootPickerSearchResult {
+    return (
+      isRecord(value) &&
+      Array.isArray(value.suggestions) &&
+      value.suggestions.every(
+        (suggestion) =>
+          isRecord(suggestion) &&
+          typeof suggestion.name === "string" &&
+          typeof suggestion.path === "string",
       )
     );
   }

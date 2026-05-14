@@ -337,6 +337,11 @@ export class DefaultCodexDesktopGitWorkerBridge
     const script = await this.resolveWorkerScript();
     const worker = new this.WorkerClass(script.workerPath, {
       name: "git",
+      env: {
+        ...process.env,
+        BUILD_FLAVOR: script.metadata.buildFlavor,
+        CODEX_BUILD_NUMBER: script.metadata.buildNumber,
+      },
       workerData: {
         workerId: "git",
         sentryInitOptions: {

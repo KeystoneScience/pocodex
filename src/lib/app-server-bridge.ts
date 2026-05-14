@@ -7,7 +7,9 @@ import { arch, homedir, platform } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { createInterface } from "node:readline";
 
-import { ensureCodexCliBinary } from "./codex-bundle.js";
+import { parse as parseToml } from "smol-toml";
+
+import { ensureCodexCliBinary, type CodexDesktopMetadata } from "./codex-bundle.js";
 import { deriveCodexHomePath } from "./codex-home.js";
 import {
   DefaultCodexDesktopGitWorkerBridge,
@@ -46,12 +48,15 @@ interface AppServerBridgeOptions {
   appPath: string;
   cwd: string;
   hostId?: string;
+  codexMetadata?: CodexBuildMetadata;
   codexHomePath?: string;
   persistedAtomRegistryPath?: string;
   workspaceRootRegistryPath?: string;
   gitWorkerBridge?: CodexDesktopGitWorkerBridge;
   codexCliPath?: string;
 }
+
+type CodexBuildMetadata = Pick<CodexDesktopMetadata, "version" | "buildFlavor" | "buildNumber">;
 
 interface WhamUsageCredits {
   has_credits: boolean;
@@ -128,6 +133,29 @@ interface RelativeFetchResponse {
 interface ManagedCodexAuth {
   accessToken: string;
   accountId: string;
+}
+
+type HostAutomationKind = "cron" | "heartbeat";
+type HostAutomationStatus = "ACTIVE" | "PAUSED" | "DELETED";
+type HostAutomationExecutionEnvironment = "local" | "worktree";
+
+interface HostAutomationItem {
+  id: string;
+  kind: HostAutomationKind;
+  name: string;
+  prompt: string;
+  status: HostAutomationStatus;
+  rrule: string;
+  cwds: string[];
+  model: string | null;
+  reasoningEffort: string | null;
+  executionEnvironment: HostAutomationExecutionEnvironment | null;
+  localEnvironmentConfigPath: string | null;
+  targetThreadId: string | null;
+  nextRunAt: number | null;
+  lastRunAt: number | null;
+  createdAt: number | null;
+  updatedAt: number | null;
 }
 
 interface AppServerMcpRequestEnvelope {
@@ -291,6 +319,7 @@ export class AppServerBridge extends EventEmitter implements HostBridge {
   private readonly workspaceRoots = new Set<string>();
   private readonly workspaceRootLabels = new Map<string, string>();
   private readonly codexHomePath: string;
+  private readonly codexMetadata: CodexBuildMetadata;
   private persistedAtomRegistryPath: string;
   private workspaceRootRegistryPath: string;
   private readonly gitWorkerBridge: CodexDesktopGitWorkerBridge;
@@ -317,6 +346,11 @@ export class AppServerBridge extends EventEmitter implements HostBridge {
     super();
     this.hostId = options.hostId ?? "local";
     this.cwd = options.cwd;
+    this.codexMetadata = options.codexMetadata ?? {
+      version: "unknown",
+      buildFlavor: "prod",
+      buildNumber: "0",
+    };
     this.codexHomePath = options.codexHomePath ?? deriveCodexHomePath();
     this.persistedAtomRegistryPath =
       options.persistedAtomRegistryPath ?? derivePersistedAtomRegistryPath();
@@ -349,6 +383,8 @@ export class AppServerBridge extends EventEmitter implements HostBridge {
     this.child = spawn(codexCliPath, ["app-server", "--listen", "stdio://"], {
       env: {
         ...process.env,
+        BUILD_FLAVOR: this.codexMetadata.buildFlavor,
+        CODEX_BUILD_NUMBER: this.codexMetadata.buildNumber,
         CODEX_HOME: this.codexHomePath,
       },
       stdio: "pipe",
@@ -719,6 +755,11 @@ export class AppServerBridge extends EventEmitter implements HostBridge {
             requestId,
             await this.listWorkspaceRootPickerEntries(payload.params),
           );
+        case "workspace-root-picker/search":
+          return buildIpcSuccessResponse(
+            requestId,
+            await this.searchWorkspaceRootPickerEntries(payload.params),
+          );
         case "workspace-root-picker/create-directory":
           return buildIpcSuccessResponse(
             requestId,
@@ -821,7 +862,7 @@ export class AppServerBridge extends EventEmitter implements HostBridge {
       clientInfo: {
         name: "pocodex",
         title: "Pocodex",
-        version: "0.1.0",
+        version: this.codexMetadata.version,
       },
       capabilities: {
         experimentalApi: true,
@@ -909,6 +950,35 @@ export class AppServerBridge extends EventEmitter implements HostBridge {
             sensitivity: "accent",
           }),
         ),
+    };
+  }
+
+  private async searchWorkspaceRootPickerEntries(params: unknown): Promise<{
+    suggestions: Array<{
+      name: string;
+      path: string;
+    }>;
+  }> {
+    const query = isJsonRecord(params) && typeof params.query === "string" ? params.query : "";
+    if (query.trim().length < WORKSPACE_ROOT_PICKER_SEARCH_MIN_QUERY_LENGTH) {
+      return {
+        suggestions: [],
+      };
+    }
+
+    const currentPath = await this.resolveWorkspaceRootPickerDirectoryPath(params, {
+      fallbackToHome: true,
+      pathKey: "currentPath",
+    }).catch(() => homedir());
+
+    return {
+      suggestions: await searchWorkspaceRootPickerDirectories({
+        query,
+        currentPath,
+        homePath: homedir(),
+        cwd: this.cwd,
+        workspaceRoots: Array.from(this.workspaceRoots),
+      }),
     };
   }
 
@@ -1812,9 +1882,10 @@ export class AppServerBridge extends EventEmitter implements HostBridge {
         return {
           status: 200,
           body: {
-            version: "0.1.0",
-            buildFlavor: "pocodex",
-            buildNumber: "0",
+            appName: "Codex",
+            version: this.codexMetadata.version,
+            buildFlavor: this.codexMetadata.buildFlavor,
+            buildNumber: this.codexMetadata.buildNumber,
           },
         };
       case "is-copilot-api-available":
@@ -1897,9 +1968,7 @@ export class AppServerBridge extends EventEmitter implements HostBridge {
       case "list-automations":
         return {
           status: 200,
-          body: {
-            items: [],
-          },
+          body: await this.listAutomations(),
         };
       case "recommended-skills":
         return {
@@ -2166,6 +2235,41 @@ export class AppServerBridge extends EventEmitter implements HostBridge {
     return {
       plan: readUsageVisibilityPlanFromAccount(result),
     };
+  }
+
+  private async listAutomations(): Promise<{ items: HostAutomationItem[] }> {
+    const automationsDirectory = join(this.codexHomePath, "automations");
+    let entries;
+    try {
+      entries = await readdir(automationsDirectory, { withFileTypes: true });
+    } catch (error) {
+      if (isFileNotFoundError(error)) {
+        return { items: [] };
+      }
+      throw error;
+    }
+
+    const items: HostAutomationItem[] = [];
+    for (const entry of entries) {
+      if (!entry.isDirectory()) {
+        continue;
+      }
+
+      const automationPath = join(automationsDirectory, entry.name, "automation.toml");
+      const item = await readHostAutomationItem(entry.name, automationPath).catch((error) => {
+        debugLog("app-server", "failed to read host automation", {
+          automationPath,
+          error: normalizeError(error).message,
+        });
+        return null;
+      });
+      if (item && item.status !== "DELETED") {
+        items.push(item);
+      }
+    }
+
+    items.sort((left, right) => (right.updatedAt ?? 0) - (left.updatedAt ?? 0));
+    return { items };
   }
 
   private async readGhCliStatus(): Promise<GhCliStatus> {
@@ -3111,6 +3215,364 @@ function compareWorkspaceRootBrowserEntries(
     numeric: true,
     sensitivity: "base",
   });
+}
+
+const WORKSPACE_ROOT_PICKER_SEARCH_MIN_QUERY_LENGTH = 2;
+const WORKSPACE_ROOT_PICKER_SEARCH_LIMIT = 12;
+const WORKSPACE_ROOT_PICKER_SEARCH_MAX_DEPTH = 4;
+const WORKSPACE_ROOT_PICKER_SEARCH_MAX_VISITED = 900;
+const WORKSPACE_ROOT_PICKER_SEARCH_IGNORED_DIRECTORIES = new Set([
+  ".cache",
+  ".git",
+  ".hg",
+  ".next",
+  ".svn",
+  ".Trash",
+  "Applications",
+  "build",
+  "coverage",
+  "dist",
+  "Library",
+  "node_modules",
+  "System",
+  "target",
+  "Volumes",
+]);
+
+interface WorkspaceRootPickerSearchOptions {
+  query: string;
+  currentPath: string;
+  homePath: string;
+  cwd: string;
+  workspaceRoots: string[];
+}
+
+interface WorkspaceRootPickerSearchRoot {
+  root: string;
+  query: string;
+}
+
+interface WorkspaceRootPickerScoredSuggestion {
+  name: string;
+  path: string;
+  score: number;
+}
+
+async function searchWorkspaceRootPickerDirectories(
+  options: WorkspaceRootPickerSearchOptions,
+): Promise<Array<{ name: string; path: string }>> {
+  const roots = await buildWorkspaceRootPickerSearchRoots(options);
+  const matches = new Map<string, WorkspaceRootPickerScoredSuggestion>();
+  const visited = {
+    count: 0,
+  };
+
+  for (const root of roots) {
+    if (visited.count >= WORKSPACE_ROOT_PICKER_SEARCH_MAX_VISITED) {
+      break;
+    }
+    await searchWorkspaceRootPickerDirectory(root, matches, visited);
+  }
+
+  return Array.from(matches.values())
+    .sort((left, right) => {
+      const scoreComparison = left.score - right.score;
+      if (scoreComparison !== 0) {
+        return scoreComparison;
+      }
+      const depthComparison = countPathSegments(left.path) - countPathSegments(right.path);
+      if (depthComparison !== 0) {
+        return depthComparison;
+      }
+      return left.path.localeCompare(right.path, undefined, {
+        numeric: true,
+        sensitivity: "base",
+      });
+    })
+    .slice(0, WORKSPACE_ROOT_PICKER_SEARCH_LIMIT)
+    .map(({ name, path }) => ({ name, path }));
+}
+
+async function buildWorkspaceRootPickerSearchRoots(
+  options: WorkspaceRootPickerSearchOptions,
+): Promise<WorkspaceRootPickerSearchRoot[]> {
+  const roots: WorkspaceRootPickerSearchRoot[] = [];
+  const query = options.query.trim();
+  const pathSearchRoot = await buildPathWorkspaceRootPickerSearchRoot(query);
+  if (pathSearchRoot) {
+    roots.push(pathSearchRoot);
+  } else {
+    for (const root of [
+      options.currentPath,
+      ...options.workspaceRoots,
+      join(options.homePath, "Projects"),
+      join(options.homePath, "Downloads"),
+      options.cwd,
+      options.homePath,
+    ]) {
+      if (!root) {
+        continue;
+      }
+      roots.push({
+        root,
+        query,
+      });
+    }
+  }
+
+  const uniqueRoots: WorkspaceRootPickerSearchRoot[] = [];
+  const seen = new Set<string>();
+  for (const root of roots) {
+    const resolvedRoot = resolve(root.root);
+    const key = `${resolvedRoot}\0${root.query.trim().toLowerCase()}`;
+    if (seen.has(key) || !(await isReadableDirectory(resolvedRoot))) {
+      continue;
+    }
+    seen.add(key);
+    uniqueRoots.push({
+      root: resolvedRoot,
+      query: root.query,
+    });
+  }
+  return uniqueRoots;
+}
+
+async function buildPathWorkspaceRootPickerSearchRoot(
+  query: string,
+): Promise<WorkspaceRootPickerSearchRoot | null> {
+  if (!isWorkspaceRootPickerPathSearch(query)) {
+    return null;
+  }
+
+  const expandedQuery = normalizeWorkspaceRootHostPath(expandWorkspaceRootPickerHome(query));
+  if (!isAbsolute(expandedQuery)) {
+    return null;
+  }
+
+  const candidatePath = resolve(expandedQuery);
+  const nearestDirectory = await findNearestExistingDirectory(candidatePath);
+  if (!nearestDirectory) {
+    return null;
+  }
+
+  const relativeQuery = relative(nearestDirectory, candidatePath).replaceAll("\\", "/");
+  return {
+    root: nearestDirectory,
+    query: relativeQuery.length > 0 ? relativeQuery : basename(candidatePath),
+  };
+}
+
+function isWorkspaceRootPickerPathSearch(query: string): boolean {
+  return (
+    query.startsWith("/") ||
+    query.startsWith("~/") ||
+    query === "~" ||
+    query.includes("\\") ||
+    /^[A-Za-z]:[\\/]/.test(query) ||
+    /^\\\\[^\\]+\\[^\\]+(?:\\|$)/.test(query)
+  );
+}
+
+async function findNearestExistingDirectory(path: string): Promise<string | null> {
+  let candidate = path;
+  for (;;) {
+    if (await isReadableDirectory(candidate)) {
+      return candidate;
+    }
+
+    const parent = dirname(candidate);
+    if (parent === candidate) {
+      return null;
+    }
+    candidate = parent;
+  }
+}
+
+async function searchWorkspaceRootPickerDirectory(
+  searchRoot: WorkspaceRootPickerSearchRoot,
+  matches: Map<string, WorkspaceRootPickerScoredSuggestion>,
+  visited: { count: number },
+): Promise<void> {
+  const tokens = tokenizeWorkspaceRootPickerSearch(searchRoot.query);
+  if (tokens.length === 0) {
+    return;
+  }
+
+  const queue: Array<{ path: string; depth: number }> = [{ path: searchRoot.root, depth: 0 }];
+  while (queue.length > 0 && visited.count < WORKSPACE_ROOT_PICKER_SEARCH_MAX_VISITED) {
+    const current = queue.shift();
+    if (!current) {
+      break;
+    }
+
+    visited.count += 1;
+    addWorkspaceRootPickerSearchMatch(current.path, searchRoot.root, tokens, matches);
+
+    if (current.depth >= WORKSPACE_ROOT_PICKER_SEARCH_MAX_DEPTH) {
+      continue;
+    }
+
+    let entries;
+    try {
+      entries = await readdir(current.path, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      if (visited.count + queue.length >= WORKSPACE_ROOT_PICKER_SEARCH_MAX_VISITED) {
+        break;
+      }
+      if (shouldSkipWorkspaceRootPickerSearchEntry(entry.name, searchRoot.query)) {
+        continue;
+      }
+
+      const entryPath = join(current.path, entry.name);
+      if (!(await isWorkspaceRootPickerSearchDirectory(entry, entryPath))) {
+        continue;
+      }
+      queue.push({
+        path: entryPath,
+        depth: current.depth + 1,
+      });
+    }
+  }
+}
+
+function addWorkspaceRootPickerSearchMatch(
+  path: string,
+  root: string,
+  tokens: string[],
+  matches: Map<string, WorkspaceRootPickerScoredSuggestion>,
+): void {
+  const name = basename(path) || path;
+  const score = scoreWorkspaceRootPickerDirectory(path, root, tokens);
+  if (score === null) {
+    return;
+  }
+
+  const existing = matches.get(path);
+  if (existing && existing.score <= score) {
+    return;
+  }
+  matches.set(path, {
+    name,
+    path,
+    score,
+  });
+}
+
+function scoreWorkspaceRootPickerDirectory(
+  path: string,
+  root: string,
+  tokens: string[],
+): number | null {
+  const normalizedName = normalizeWorkspaceRootPickerSearchText(basename(path) || path);
+  const normalizedRelativePath = normalizeWorkspaceRootPickerSearchText(relative(root, path));
+  const normalizedPath = normalizeWorkspaceRootPickerSearchText(path);
+  let score = Math.max(0, countPathSegments(path) - countPathSegments(root)) * 8;
+
+  for (const token of tokens) {
+    const tokenScore = Math.min(
+      fuzzyWorkspaceRootPickerScore(normalizedName, token) ?? Number.POSITIVE_INFINITY,
+      fuzzyWorkspaceRootPickerScore(normalizedRelativePath, token) ?? Number.POSITIVE_INFINITY,
+      fuzzyWorkspaceRootPickerScore(normalizedPath, token) ?? Number.POSITIVE_INFINITY,
+    );
+    if (!Number.isFinite(tokenScore)) {
+      return null;
+    }
+    score += tokenScore;
+  }
+
+  if (basename(path).startsWith(".")) {
+    score += 60;
+  }
+
+  return score;
+}
+
+function fuzzyWorkspaceRootPickerScore(candidate: string, query: string): number | null {
+  if (!candidate || !query) {
+    return null;
+  }
+  if (candidate === query) {
+    return 0;
+  }
+  if (candidate.startsWith(query)) {
+    return 10 + candidate.length - query.length;
+  }
+
+  const substringIndex = candidate.indexOf(query);
+  if (substringIndex >= 0) {
+    return 35 + substringIndex + candidate.length - query.length;
+  }
+
+  let queryIndex = 0;
+  let gapScore = 0;
+  let previousMatchIndex = -1;
+  for (let candidateIndex = 0; candidateIndex < candidate.length; candidateIndex += 1) {
+    if (candidate[candidateIndex] !== query[queryIndex]) {
+      continue;
+    }
+    if (previousMatchIndex >= 0) {
+      gapScore += candidateIndex - previousMatchIndex - 1;
+    }
+    previousMatchIndex = candidateIndex;
+    queryIndex += 1;
+    if (queryIndex === query.length) {
+      return 80 + gapScore + candidate.length - query.length;
+    }
+  }
+
+  return null;
+}
+
+function tokenizeWorkspaceRootPickerSearch(query: string): string[] {
+  return normalizeWorkspaceRootPickerSearchText(query)
+    .split(/[^a-z0-9.]+/i)
+    .filter((token) => token.length >= WORKSPACE_ROOT_PICKER_SEARCH_MIN_QUERY_LENGTH);
+}
+
+function normalizeWorkspaceRootPickerSearchText(value: string): string {
+  return value.trim().toLowerCase().replaceAll("\\", "/");
+}
+
+function shouldSkipWorkspaceRootPickerSearchEntry(name: string, query: string): boolean {
+  if (WORKSPACE_ROOT_PICKER_SEARCH_IGNORED_DIRECTORIES.has(name)) {
+    return true;
+  }
+  return name.startsWith(".") && !query.includes(".");
+}
+
+async function isWorkspaceRootPickerSearchDirectory(
+  entry: { isDirectory: () => boolean; isSymbolicLink: () => boolean },
+  path: string,
+): Promise<boolean> {
+  if (entry.isDirectory()) {
+    return true;
+  }
+  if (!entry.isSymbolicLink()) {
+    return false;
+  }
+
+  return await isReadableDirectory(path);
+}
+
+async function isReadableDirectory(path: string): Promise<boolean> {
+  try {
+    const stats = await stat(path);
+    if (!stats.isDirectory()) {
+      return false;
+    }
+    await readdir(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function countPathSegments(path: string): number {
+  return path.split(/[\\/]+/).filter((segment) => segment.length > 0).length;
 }
 
 async function readWhamUsageFromCodexHome(codexHomePath: string): Promise<WhamUsageResponse> {
@@ -4215,9 +4677,7 @@ function convertWorkspaceRootWslUncPathToLinux(path: string): string | null {
 }
 
 function isRunningInWsl(): boolean {
-  return (
-    process.platform === "linux" && Boolean(process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP)
-  );
+  return Boolean(process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP);
 }
 
 function normalizeWorkspaceRootPickerPathError(error: unknown): Error {
@@ -4236,6 +4696,85 @@ function normalizeWorkspaceRootPickerPathError(error: unknown): Error {
 
 function normalizeError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
+}
+
+async function readHostAutomationItem(
+  automationDirectoryName: string,
+  automationPath: string,
+): Promise<HostAutomationItem | null> {
+  const [raw, fileStat] = await Promise.all([
+    readFile(automationPath, "utf8"),
+    stat(automationPath),
+  ]);
+  const parsed = parseToml(raw);
+  if (!isJsonRecord(parsed)) {
+    throw new Error("Automation TOML must contain a top-level table.");
+  }
+
+  const kind = readAutomationKind(parsed.kind);
+  const id = readAutomationString(parsed.id) ?? basename(dirname(automationPath));
+  if (id !== automationDirectoryName) {
+    return null;
+  }
+  const name = readAutomationString(parsed.name) ?? id;
+  const prompt = readAutomationString(parsed.prompt);
+  const rrule = readAutomationString(parsed.rrule);
+  if (!id || !prompt || !rrule) {
+    return null;
+  }
+
+  return {
+    id,
+    kind,
+    name,
+    prompt,
+    rrule,
+    status: readAutomationStatus(parsed.status),
+    cwds: kind === "cron" ? readStringList(parsed.cwds) : [],
+    model: kind === "cron" ? readAutomationString(parsed.model) : null,
+    reasoningEffort: kind === "cron" ? readAutomationString(parsed.reasoning_effort) : null,
+    executionEnvironment:
+      kind === "cron" ? readExecutionEnvironment(parsed.execution_environment) : null,
+    localEnvironmentConfigPath:
+      kind === "cron" ? readAutomationString(parsed.local_environment_config_path) : null,
+    targetThreadId: kind === "heartbeat" ? readAutomationString(parsed.target_thread_id) : null,
+    nextRunAt: readOptionalNumber(parsed.next_run_at),
+    lastRunAt: readOptionalNumber(parsed.last_run_at),
+    createdAt: readOptionalNumber(parsed.created_at) ?? Math.trunc(fileStat.birthtimeMs),
+    updatedAt: readOptionalNumber(parsed.updated_at) ?? Math.trunc(fileStat.mtimeMs),
+  };
+}
+
+function readAutomationKind(value: unknown): HostAutomationKind {
+  return value === "heartbeat" ? "heartbeat" : "cron";
+}
+
+function readAutomationStatus(value: unknown): HostAutomationStatus {
+  if (value === "DELETED") {
+    return "DELETED";
+  }
+  if (value === "PAUSED" || value === "INACTIVE") {
+    return "PAUSED";
+  }
+  return "ACTIVE";
+}
+
+function readExecutionEnvironment(value: unknown): HostAutomationExecutionEnvironment {
+  return value === "worktree" ? "worktree" : "local";
+}
+
+function readAutomationString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function readStringList(value: unknown): string[] {
+  if (typeof value === "string" && value.trim().length > 0) {
+    return [value];
+  }
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter((item): item is string => typeof item === "string" && item.trim().length > 0);
 }
 
 function resolveCodexAgentsMarkdownPath(): string {

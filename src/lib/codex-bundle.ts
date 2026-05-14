@@ -29,6 +29,7 @@ interface CodexDesktopPackageJson {
 
 interface CodexInfoPlist {
   CFBundleShortVersionString?: string;
+  CFBundleVersion?: string | number;
 }
 
 type CodexDesktopLayout = "macos-app" | "windows-app";
@@ -119,6 +120,8 @@ export async function loadCodexDesktopMetadata(appPath: string): Promise<CodexDe
     await extractAsarText(paths.appAsarPath, "package.json"),
   ) as CodexDesktopPackageJson;
 
+  const buildNumber = desktopPackage.codexBuildNumber ?? infoPlist.CFBundleVersion;
+
   return {
     appPath: paths.appPath,
     appAsarPath: paths.appAsarPath,
@@ -126,7 +129,7 @@ export async function loadCodexDesktopMetadata(appPath: string): Promise<CodexDe
     layout: paths.layout,
     version: desktopPackage.version ?? infoPlist.CFBundleShortVersionString ?? "unknown",
     buildFlavor: desktopPackage.codexBuildFlavor ?? "prod",
-    buildNumber: desktopPackage.codexBuildNumber ?? "0",
+    buildNumber: buildNumber == null ? "0" : String(buildNumber),
   };
 }
 

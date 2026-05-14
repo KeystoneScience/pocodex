@@ -727,6 +727,7 @@ function createBootstrapHarness(
     Array,
     Map,
     Set,
+    Date,
     Math,
     JSON,
     Promise,
@@ -1008,6 +1009,165 @@ describe("renderBootstrapScript", () => {
         credentials: "same-origin",
       },
     });
+  });
+
+  it("validates and switches to a remote app server from the app server switcher", async () => {
+    const script = renderBootstrapScript({
+      sentryOptions: {
+        buildFlavor: "stable",
+        appVersion: "1",
+        buildNumber: "123",
+        codexAppSessionId: "session-id",
+      },
+      stylesheetHref: "/pocodex.css",
+      importIconSvg: '<svg viewBox="0 0 1 1"></svg>',
+    });
+
+    const harness = createBootstrapHarness();
+    const appServerCheckUrls: URL[] = [];
+    harness.setFetchHandler((input) => {
+      const requestPath = String(input);
+      if (requestPath.startsWith("/app-server-check?")) {
+        appServerCheckUrls.push(new URL(requestPath, "http://127.0.0.1:8787"));
+        return createBootstrapJsonResponse({ ok: true });
+      }
+      return createBootstrapJsonResponse({ ok: true });
+    });
+
+    harness.run(script);
+    await flushBootstrapMicrotasks();
+
+    const switcherButton = harness.document.querySelector(
+      'button[data-pocodex-app-server-switcher-button="true"]',
+    );
+    expect(switcherButton).toBeTruthy();
+    switcherButton?.click();
+
+    const urlInput = harness.document.querySelector(
+      'input[data-pocodex-app-server-url-input="true"]',
+    );
+    const tokenInput = harness.document.querySelector(
+      'input[data-pocodex-app-server-token-input="true"]',
+    );
+    const testButton = harness.document.querySelector(
+      'button[data-pocodex-app-server-switcher-test="true"]',
+    );
+    const remoteSwitchButton = harness.document.querySelector(
+      'button[data-pocodex-app-server-switcher-switch="true"]',
+    );
+
+    expect(urlInput).toBeTruthy();
+    expect(tokenInput).toBeTruthy();
+    expect(testButton).toBeTruthy();
+    expect(remoteSwitchButton).toBeTruthy();
+    expect(testButton?.disabled).toBe(true);
+    expect(remoteSwitchButton?.disabled).toBe(true);
+
+    if (!urlInput || !tokenInput || !testButton || !remoteSwitchButton) {
+      throw new Error("Expected app server switcher controls to exist");
+    }
+
+    urlInput.value = "desktop.local:8788";
+    urlInput.dispatchEvent({ type: "input" });
+    tokenInput.value = "remote-secret";
+    tokenInput.dispatchEvent({ type: "input" });
+
+    expect(testButton.disabled).toBe(false);
+    expect(remoteSwitchButton.disabled).toBe(false);
+
+    testButton.click();
+    await flushBootstrapMicrotasks();
+
+    const feedback = harness.document.querySelector(
+      '[data-pocodex-app-server-switcher-feedback="true"]',
+    );
+    expect(feedback?.textContent).toBe("Ready: http://desktop.local:8788");
+
+    remoteSwitchButton.click();
+    await flushBootstrapMicrotasks();
+
+    const remoteCheckCalls = harness.fetchCalls.filter((call) =>
+      String(call.input).startsWith("/app-server-check?"),
+    );
+    expect(remoteCheckCalls).toHaveLength(2);
+    expect(appServerCheckUrls).toHaveLength(2);
+    for (const checkUrl of appServerCheckUrls) {
+      expect(checkUrl.searchParams.get("token")).toBe("secret");
+      expect(checkUrl.searchParams.get("url")).toBe(
+        "http://desktop.local:8788/session-check?token=remote-secret",
+      );
+    }
+    expect(harness.windowObject.location.href).toBe(
+      "http://desktop.local:8788/?token=remote-secret",
+    );
+  });
+
+  it("lists SSH aliases and switches through an SSH-backed app server", async () => {
+    const script = renderBootstrapScript({
+      sentryOptions: {
+        buildFlavor: "stable",
+        appVersion: "1",
+        buildNumber: "123",
+        codexAppSessionId: "session-id",
+      },
+      stylesheetHref: "/pocodex.css",
+      importIconSvg: '<svg viewBox="0 0 1 1"></svg>',
+    });
+
+    const harness = createBootstrapHarness();
+    const connectRequests: unknown[] = [];
+    harness.setFetchHandler((input, init) => {
+      const requestPath = String(input);
+      if (requestPath.startsWith("/ssh-app-server-aliases?")) {
+        return createBootstrapJsonResponse({
+          ok: true,
+          aliases: [
+            {
+              alias: "desktop",
+              display: "desktop (codex@example.internal:2222)",
+              hostName: "example.internal",
+              port: "2222",
+              user: "codex",
+            },
+          ],
+        });
+      }
+      if (requestPath.startsWith("/ssh-app-server-connect?")) {
+        connectRequests.push(JSON.parse(readBootstrapFetchBody({ input, init })));
+        return createBootstrapJsonResponse({
+          ok: true,
+          connection: {
+            alias: "desktop",
+            appUrl: "http://127.0.0.1:8789/?token=remote-token",
+            displayUrl: "http://127.0.0.1:8789",
+            launcherAvailable: false,
+            localPort: 8789,
+            remotePort: 8788,
+            token: "remote-token",
+          },
+        });
+      }
+      return createBootstrapJsonResponse({ ok: true });
+    });
+
+    harness.run(script);
+    await flushBootstrapMicrotasks();
+
+    harness.document
+      .querySelector('button[data-pocodex-app-server-switcher-button="true"]')
+      ?.click();
+    await flushBootstrapMicrotasks();
+    await flushBootstrapMicrotasks();
+
+    const aliasButton = harness.document.querySelector(
+      'button[data-pocodex-app-server-ssh-alias="desktop"]',
+    );
+    expect(aliasButton).toBeTruthy();
+    aliasButton?.click();
+    await flushBootstrapMicrotasks();
+
+    expect(connectRequests).toEqual([{ alias: "desktop" }]);
+    expect(harness.windowObject.location.href).toBe("http://127.0.0.1:8789/?token=remote-token");
   });
 
   it("runs without throwing and installs the browser bridge", () => {
@@ -3957,6 +4117,124 @@ describe("renderBootstrapScript", () => {
       'input[data-pocodex-workspace-root-picker-path-input="true"]',
     );
     expect(createdPathInput?.value).toBe("/home/tester/manual-project/child");
+  });
+
+  it("shows bridge-backed folder suggestions while typing in the workspace root picker", async () => {
+    const script = renderBootstrapScript({
+      sentryOptions: {
+        buildFlavor: "stable",
+        appVersion: "1",
+        buildNumber: "123",
+        codexAppSessionId: "session-id",
+      },
+      stylesheetHref: "/pocodex.css",
+    });
+
+    const harness = createBootstrapHarness();
+    const ipcRequests: Array<{ method: string; params: unknown }> = [];
+    harness.setFetchHandler(async (input, init) => {
+      const body = readBootstrapFetchBody({ input, init });
+      if (!body) {
+        return createBootstrapJsonResponse({});
+      }
+
+      const payload = JSON.parse(body) as {
+        method?: string;
+        params?: {
+          path?: string;
+          query?: string;
+          currentPath?: string;
+        };
+      };
+      if (typeof payload.method === "string") {
+        ipcRequests.push({
+          method: payload.method,
+          params: payload.params,
+        });
+      }
+
+      if (payload.method === "workspace-root-picker/search") {
+        return createBootstrapJsonResponse({
+          resultType: "success",
+          result: {
+            suggestions: [
+              {
+                name: "FullStack",
+                path: "/remote/home/Ditto/FullStack",
+              },
+            ],
+          },
+        });
+      }
+
+      if (payload.method === "workspace-root-picker/list") {
+        const requestedPath = payload.params?.path;
+        return createBootstrapJsonResponse({
+          resultType: "success",
+          result: {
+            currentPath: requestedPath ?? "/remote/home",
+            parentPath: "/remote/home",
+            homePath: "/remote/home",
+            entries: [],
+          },
+        });
+      }
+
+      return createBootstrapJsonResponse({});
+    });
+
+    harness.run(script);
+    await flushBootstrapMicrotasks();
+
+    harness.emitServerEnvelope({
+      type: "bridge_message",
+      message: {
+        type: "pocodex-open-workspace-root-picker",
+        context: "manual",
+        initialPath: "/remote/home",
+      },
+    });
+    await flushBootstrapMicrotasks();
+
+    const pathInput = harness.document.querySelector(
+      'input[data-pocodex-workspace-root-picker-path-input="true"]',
+    );
+    expect(pathInput).toBeTruthy();
+    if (!pathInput) {
+      throw new Error("Expected path input to exist");
+    }
+
+    pathInput.value = "fullstack";
+    pathInput.dispatchEvent({ type: "input" });
+    drainTestTimers(harness.timers, 5);
+    await flushBootstrapMicrotasks();
+    await flushBootstrapMicrotasks();
+
+    expect(ipcRequests).toContainEqual({
+      method: "workspace-root-picker/search",
+      params: {
+        query: "fullstack",
+        currentPath: "/remote/home",
+      },
+    });
+
+    const suggestion = harness.document.querySelector(
+      'button[data-pocodex-workspace-root-picker-suggestion="true"]',
+    );
+    expect(suggestion?.dataset.pocodexWorkspaceRootPickerSuggestionPath).toBe(
+      "/remote/home/Ditto/FullStack",
+    );
+
+    suggestion?.dispatchEvent(new TestMouseEvent("click", { target: suggestion }));
+    await flushBootstrapMicrotasks();
+    await flushBootstrapMicrotasks();
+
+    expect(ipcRequests.at(-1)).toEqual({
+      method: "workspace-root-picker/list",
+      params: {
+        path: "/remote/home/Ditto/FullStack",
+      },
+    });
   });
 
   it("confirms the typed folder path without requiring an open round-trip first", async () => {

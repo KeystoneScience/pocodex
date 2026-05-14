@@ -47,6 +47,65 @@ pocodex --listen 0.0.0.0:8787 --token "$(openssl rand -hex 16)"
 
 When listening on `0.0.0.0`, Pocodex also prints a preferred LAN URL if it can find one.
 
+## Remote App Servers Over SSH
+
+This fork adds an **App server** switcher to the Pocodex UI. It can connect the browser UI to a Pocodex app server running on another Mac or Linux host through an SSH tunnel.
+
+The safest pattern is:
+
+1. Run Pocodex on the remote machine bound to loopback only.
+2. Forward it to your local machine with SSH.
+3. Open the forwarded local URL in the browser.
+
+Manual example:
+
+```bash
+# On the remote host
+cd ~/Downloads/pocodex
+pnpm install --frozen-lockfile
+pnpm run build
+node dist/cli.js --listen 127.0.0.1:8788 --token "$(openssl rand -hex 16)"
+
+# On your local machine
+ssh -fN \
+  -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=30 \
+  -o ServerAliveCountMax=3 \
+  -L 127.0.0.1:8789:127.0.0.1:8788 \
+  your-ssh-alias
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8789/?token=<remote-token>
+```
+
+### One-click SSH alias switching
+
+Open the **App server** button in the Pocodex UI. The **SSH aliases** section reads aliases from the current Pocodex host's `~/.ssh/config`.
+
+Clicking an alias will:
+
+- verify the alias exists in SSH config
+- check that the remote has `/Applications/Codex.app`
+- start remote Pocodex in a `tmux` session named `pocodex-remote`
+- create or reuse a local loopback tunnel
+- switch the current browser to the tunneled URL
+- offer to create a Desktop quick-launch app on macOS
+
+For the SSH alias flow, the remote machine should already have this repo built at:
+
+```text
+~/Downloads/pocodex
+```
+
+That keeps the remote startup command simple and avoids exposing Pocodex directly on the LAN. If you want a different remote path, change `REMOTE_POCODEX_DIR` in `src/lib/ssh-app-server.ts`.
+
+### Desktop quick-launch apps
+
+When SSH alias switching succeeds on macOS, Pocodex can create a small `.app` on your Desktop. The app reuses the saved alias, token, and local port, starts the remote tmux session if needed, recreates the SSH tunnel if needed, and opens the forwarded Pocodex URL.
+
 ## CLI
 
 ```text
@@ -97,6 +156,8 @@ Codex's webview expects to live inside Electron with a pile of host APIs behind 
 - git integration is bridged through the desktop git worker extracted from the Codex bundle
 - browser `vscode://codex/ipc-request` traffic is translated onto Pocodex's host IPC endpoint
 - workspace roots, persisted atoms, and related desktop state are mirrored on the host side
+- automations, plugins, skills, and workspace picker data are read through the app-server bridge where possible
+- optional SSH alias switching can start a remote Pocodex instance and tunnel it back to the browser
 - unsupported native features are blocked or stubbed where needed
 
 The shim behavior was derived by treating the shipped and minified `Codex.app` code as the implementation oracle.

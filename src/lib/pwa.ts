@@ -141,10 +141,14 @@ function registerPocodexServiceWorker(config: ServiceWorkerRuntimeConfig): void 
   const cachePrefix = "pocodex-shell:";
   const staticDestinations = new Set(["font", "image", "script", "style"]);
   const bypassPaths = new Set([
+    "/app-server-check",
     "/healthz",
     "/ipc-request",
     "/manifest.webmanifest",
     "/session-check",
+    "/ssh-app-server-aliases",
+    "/ssh-app-server-connect",
+    "/ssh-app-server-launcher",
   ]);
 
   globalScope.addEventListener("install", (event: Event) => {

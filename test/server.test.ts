@@ -227,6 +227,51 @@ describe("PocodexServer", () => {
     await expect(unauthorizedResponse.json()).resolves.toEqual({ ok: false });
   });
 
+  it("checks remote app servers through the current authorized Pocodex server", async () => {
+    const current = await createTestServer();
+    const remote = await createTestServer("remote-secret");
+    servers.push(current.server, remote.server);
+
+    const targetUrl = new URL(`${remote.url}/session-check`);
+    targetUrl.searchParams.set("token", "remote-secret");
+
+    const okResponse = await fetch(
+      `${current.url}/app-server-check?token=secret&url=${encodeURIComponent(
+        targetUrl.toString(),
+      )}`,
+    );
+
+    expect(okResponse.status).toBe(200);
+    await expect(okResponse.json()).resolves.toEqual({
+      ok: true,
+      origin: remote.url,
+    });
+
+    const badRemoteTokenUrl = new URL(`${remote.url}/session-check`);
+    badRemoteTokenUrl.searchParams.set("token", "wrong");
+    const rejectedRemoteResponse = await fetch(
+      `${current.url}/app-server-check?token=secret&url=${encodeURIComponent(
+        badRemoteTokenUrl.toString(),
+      )}`,
+    );
+
+    expect(rejectedRemoteResponse.status).toBe(401);
+    await expect(rejectedRemoteResponse.json()).resolves.toEqual({
+      ok: false,
+      error: "That server rejected the token.",
+    });
+
+    const rejectedCurrentResponse = await fetch(
+      `${current.url}/app-server-check?token=wrong&url=${encodeURIComponent(targetUrl.toString())}`,
+    );
+
+    expect(rejectedCurrentResponse.status).toBe(401);
+    await expect(rejectedCurrentResponse.json()).resolves.toEqual({
+      ok: false,
+      error: "This Pocodex session is no longer authorized.",
+    });
+  });
+
   it("allows unauthenticated session checks and websocket attach when no token is configured", async () => {
     const { server, url } = await createTestServer("");
     servers.push(server);

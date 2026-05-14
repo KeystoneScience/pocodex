@@ -15,6 +15,7 @@ import { WebSocket, WebSocketServer } from "ws";
 
 import { debugLog } from "./debug.js";
 import { getUnsupportedBridgeNotice } from "./native-policy.js";
+import { SshAppServerManager } from "./ssh-app-server.js";
 import type {
   JsonRecord,
   BrowserToServerEnvelope,
@@ -52,6 +53,7 @@ const TERMINAL_TARGET_BROWSER_SESSION_ID_KEY = "_pocodexBrowserSessionId";
 const TERMINAL_TARGET_BROWSER_TERMINAL_SESSION_ID_KEY = "_pocodexBrowserTerminalSessionId";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
 const DEFAULT_HEARTBEAT_TIMEOUT_MS = 45_000;
+const APP_SERVER_CHECK_TIMEOUT_MS = 3_000;
 
 export class PocodexServer {
   private readonly httpServer: HttpServer;
@@ -64,6 +66,7 @@ export class PocodexServer {
   private readonly heartbeatIntervalMs: number;
   private readonly heartbeatTimeoutMs: number;
   private readonly heartbeatTimer: NodeJS.Timeout;
+  private readonly sshAppServers = new SshAppServerManager();
   private indexHtmlPromise?: Promise<string>;
   private serviceWorkerScriptPromise?: Promise<string>;
   private webManifestPromise?: Promise<string>;
@@ -184,6 +187,26 @@ export class PocodexServer {
       response.setHeader("Cache-Control", "no-store");
       response.setHeader("Content-Type", "application/json; charset=utf-8");
       response.end(JSON.stringify({ ok: authorized }));
+      return;
+    }
+
+    if (url.pathname === "/app-server-check") {
+      await this.handleAppServerCheckRequest(url, response);
+      return;
+    }
+
+    if (url.pathname === "/ssh-app-server-aliases") {
+      await this.handleSshAppServerAliasesRequest(url, response);
+      return;
+    }
+
+    if (url.pathname === "/ssh-app-server-connect") {
+      await this.handleSshAppServerConnectRequest(request, url, response);
+      return;
+    }
+
+    if (url.pathname === "/ssh-app-server-launcher") {
+      await this.handleSshAppServerLauncherRequest(request, url, response);
       return;
     }
 
@@ -317,6 +340,212 @@ export class PocodexServer {
 
   private isAuthorized(requestToken: string | null): boolean {
     return this.options.token.length === 0 || requestToken === this.options.token;
+  }
+
+  private async handleAppServerCheckRequest(url: URL, response: ServerResponse): Promise<void> {
+    if (!this.isAuthorized(url.searchParams.get("token"))) {
+      writeJsonResponse(response, 401, {
+        ok: false,
+        error: "This Pocodex session is no longer authorized.",
+      });
+      return;
+    }
+
+    const rawTargetUrl = url.searchParams.get("url")?.trim();
+    if (!rawTargetUrl) {
+      writeJsonResponse(response, 400, {
+        ok: false,
+        error: "Missing app server URL.",
+      });
+      return;
+    }
+
+    let targetUrl: URL;
+    try {
+      targetUrl = new URL(rawTargetUrl);
+    } catch {
+      writeJsonResponse(response, 400, {
+        ok: false,
+        error: "Invalid app server URL.",
+      });
+      return;
+    }
+
+    if (
+      (targetUrl.protocol !== "http:" && targetUrl.protocol !== "https:") ||
+      targetUrl.pathname !== "/session-check"
+    ) {
+      writeJsonResponse(response, 400, {
+        ok: false,
+        error: "Use an http or https Pocodex session-check URL.",
+      });
+      return;
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => {
+      controller.abort();
+    }, APP_SERVER_CHECK_TIMEOUT_MS);
+    timeout.unref?.();
+
+    try {
+      const targetResponse = await fetch(targetUrl, {
+        cache: "no-store",
+        redirect: "manual",
+        signal: controller.signal,
+        headers: {
+          accept: "application/json",
+        },
+      });
+
+      if (targetResponse.status === 401) {
+        writeJsonResponse(response, 401, {
+          ok: false,
+          error: "That server rejected the token.",
+        });
+        return;
+      }
+
+      if (!targetResponse.ok) {
+        writeJsonResponse(response, 502, {
+          ok: false,
+          error: `That server returned ${targetResponse.status}.`,
+        });
+        return;
+      }
+
+      let payload: unknown;
+      try {
+        payload = await targetResponse.json();
+      } catch {
+        writeJsonResponse(response, 502, {
+          ok: false,
+          error: "That URL did not answer like a Pocodex server.",
+        });
+        return;
+      }
+
+      if (!isJsonRecord(payload) || payload.ok !== true) {
+        writeJsonResponse(response, 502, {
+          ok: false,
+          error: "That URL did not answer like a Pocodex server.",
+        });
+        return;
+      }
+
+      writeJsonResponse(response, 200, {
+        ok: true,
+        origin: targetUrl.origin,
+      });
+    } catch (error) {
+      const isAbortError =
+        error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError");
+      writeJsonResponse(response, isAbortError ? 504 : 502, {
+        ok: false,
+        error: isAbortError
+          ? "Timed out while checking that app server."
+          : "Failed to reach that app server.",
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  private async handleSshAppServerAliasesRequest(
+    url: URL,
+    response: ServerResponse,
+  ): Promise<void> {
+    if (!this.isAuthorized(url.searchParams.get("token"))) {
+      writeJsonResponse(response, 401, {
+        ok: false,
+        error: "This Pocodex session is no longer authorized.",
+      });
+      return;
+    }
+
+    try {
+      writeJsonResponse(response, 200, {
+        ok: true,
+        aliases: await this.sshAppServers.listAliases(),
+      });
+    } catch (error) {
+      writeJsonResponse(response, 500, {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private async handleSshAppServerConnectRequest(
+    request: IncomingMessage,
+    url: URL,
+    response: ServerResponse,
+  ): Promise<void> {
+    if (!this.isAuthorized(url.searchParams.get("token"))) {
+      writeJsonResponse(response, 401, {
+        ok: false,
+        error: "This Pocodex session is no longer authorized.",
+      });
+      return;
+    }
+
+    const payload = await readJsonRequestBody(request);
+    const alias = readStringProperty(payload, "alias");
+    if (!alias) {
+      writeJsonResponse(response, 400, {
+        ok: false,
+        error: "Choose an SSH alias.",
+      });
+      return;
+    }
+
+    try {
+      writeJsonResponse(response, 200, {
+        ok: true,
+        connection: await this.sshAppServers.connect(alias),
+      });
+    } catch (error) {
+      writeJsonResponse(response, 500, {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private async handleSshAppServerLauncherRequest(
+    request: IncomingMessage,
+    url: URL,
+    response: ServerResponse,
+  ): Promise<void> {
+    if (!this.isAuthorized(url.searchParams.get("token"))) {
+      writeJsonResponse(response, 401, {
+        ok: false,
+        error: "This Pocodex session is no longer authorized.",
+      });
+      return;
+    }
+
+    const payload = await readJsonRequestBody(request);
+    const alias = readStringProperty(payload, "alias");
+    if (!alias) {
+      writeJsonResponse(response, 400, {
+        ok: false,
+        error: "Choose an SSH alias.",
+      });
+      return;
+    }
+
+    try {
+      writeJsonResponse(response, 200, {
+        ok: true,
+        launcher: await this.sshAppServers.createLauncher(alias),
+      });
+    } catch (error) {
+      writeJsonResponse(response, 500, {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   private async handleSocketMessage(session: BrowserSession, raw: string): Promise<void> {
@@ -881,6 +1110,39 @@ async function readRequestBody(request: IncomingMessage): Promise<string> {
     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
   }
   return Buffer.concat(chunks).toString("utf8");
+}
+
+async function readJsonRequestBody(request: IncomingMessage): Promise<unknown> {
+  const rawBody = await readRequestBody(request);
+  if (!rawBody) {
+    return {};
+  }
+
+  try {
+    return JSON.parse(rawBody) as unknown;
+  } catch {
+    return {};
+  }
+}
+
+function readStringProperty(payload: unknown, key: string): string | null {
+  if (!isJsonRecord(payload) || typeof payload[key] !== "string") {
+    return null;
+  }
+
+  const value = payload[key].trim();
+  return value.length > 0 ? value : null;
+}
+
+function writeJsonResponse(
+  response: ServerResponse,
+  statusCode: number,
+  body: Record<string, unknown>,
+): void {
+  response.statusCode = statusCode;
+  response.setHeader("Cache-Control", "no-store");
+  response.setHeader("Content-Type", "application/json; charset=utf-8");
+  response.end(JSON.stringify(body));
 }
 
 function extractRequestId(payload: unknown): string {
