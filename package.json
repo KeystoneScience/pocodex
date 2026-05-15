@@ -1,6 +1,6 @@
 {
   "name": "pocodex",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Mirror the real Codex desktop webview in a browser and switch to remote app servers over SSH.",
   "keywords": [
     "browser",
