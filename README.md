@@ -1,72 +1,99 @@
-# <img src="https://i.imgur.com/ionPEb2.png" alt="Pocodex" width="300">
+# Remote Codex Browser Mirror
 
-Pocodex lets you use the Codex desktop app in a regular browser, including on your phone or any other remote device. It's like Claude Code's Remote Control, but for Codex!
+Remote Codex Browser Mirror runs the real Codex desktop webview in a normal browser and bridges it back to a Codex app server. The goal is simple: keep Codex running on the machine that has the state, credentials, plugins, skills, automations, filesystem, and desktop access, while controlling it from another browser tab, laptop, phone, or SSH-tunneled machine.
 
-It serves the real Codex desktop webview from the installed app bundle, reuses the bundled `codex app-server` as the agentic harness, and adds host-side shims for the desktop functionality the UI expects.
+This is a fork of Pocodex focused on remote app-server switching. The inherited CLI binary is still named `pocodex`, but this repository is aimed at the remote Codex mirror workflow.
 
-<img src="https://i.imgur.com/mInn7oW.png" alt="Pocodex screenshot" width="200">
+## What It Does
 
-## Install
+- Serves the real Codex desktop UI from the installed Codex app bundle.
+- Starts and bridges to Codex's bundled `codex app-server`.
+- Mirrors the app-server-backed data the UI expects, including plugins, skills, automations, account state, projects, and workspace roots where available.
+- Adds an **App server** switcher to connect the browser to a different Codex host.
+- Discovers SSH aliases from `~/.ssh/config`, starts the remote mirror in `tmux`, creates a loopback SSH tunnel, and switches the browser to the remote app server.
+- Offers a macOS Desktop quick-launch app for saved SSH targets.
+- Improves the add-project folder picker with bridge-backed directory browsing and lightweight fuzzy folder search.
 
-Download the desktop app from [download.pocodex.app](https://download.pocodex.app/).
+## Good Use Cases
 
-Or install the CLI:
-
-```bash
-pnpm add -g pocodex
-```
-
-## Run
-
-```bash
-pocodex
-```
-
-Pocodex prints a local URL and, when applicable, an "Open" URL. Open the printed URL in your browser.
-
-Pocodex now publishes a web manifest and service worker, so on supported browsers you can install it as a standalone app. If you are using a tokenized URL, open that URL once in the browser you plan to install from so the token is stored for later standalone launches.
+- Run Codex on a desktop that stays awake while you close your laptop.
+- Control a remote Codex install through a browser without exposing the remote service publicly.
+- Keep plugins, skills, automations, and Computer Use tied to the machine that actually has them installed.
+- Switch between local and remote Codex app servers from inside the mirrored UI.
+- Open a phone or tablet browser to a trusted LAN or tunneled Codex session.
 
 ## Requirements
 
-- macOS with a local Codex install, usually `/Applications/Codex.app`, or WSL with the Windows Codex install available under `C:\Program Files\WindowsApps\OpenAI.Codex_...\app`
+- macOS with Codex installed, usually at `/Applications/Codex.app`
 - Node.js 24 or newer
+- pnpm 9.x
+- SSH access to any remote host you want to control
+- `tmux` on remote hosts for the one-click SSH alias flow
 
-## Common Usage
+WSL support from upstream Pocodex is still present, but the remote SSH workflow here is primarily designed around Mac hosts running Codex Desktop.
 
-Run with the defaults:
+## Install From Source
 
 ```bash
-pocodex
+git clone https://github.com/KeystoneScience/remote-codex-browser-mirror.git
+cd remote-codex-browser-mirror
+pnpm install --frozen-lockfile
+pnpm run build
 ```
 
-Expose it on your LAN with a session token:
+Run it:
 
 ```bash
-pocodex --listen 0.0.0.0:8787 --token "$(openssl rand -hex 16)"
+node dist/cli.js --listen 127.0.0.1:8788 --token "$(openssl rand -hex 16)"
 ```
 
-When listening on `0.0.0.0`, Pocodex also prints a preferred LAN URL if it can find one.
+Open the printed URL in your browser. If you bind beyond loopback, always use a long random token.
 
-## Remote App Servers Over SSH
+## Local Browser Mirror
 
-This fork adds an **App server** switcher to the Pocodex UI. It can connect the browser UI to a Pocodex app server running on another Mac or Linux host through an SSH tunnel.
-
-The safest pattern is:
-
-1. Run Pocodex on the remote machine bound to loopback only.
-2. Forward it to your local machine with SSH.
-3. Open the forwarded local URL in the browser.
-
-Manual example:
+For local-only use:
 
 ```bash
-# On the remote host
+node dist/cli.js
+```
+
+For a trusted LAN session:
+
+```bash
+node dist/cli.js --listen 0.0.0.0:8788 --token "$(openssl rand -hex 16)"
+```
+
+When listening on `0.0.0.0`, the CLI prints a preferred LAN URL if it can find one.
+
+## Remote Over SSH
+
+The safest remote pattern is:
+
+1. Run the mirror on the remote machine bound to `127.0.0.1`.
+2. Forward that remote loopback port to your local machine with SSH.
+3. Open the forwarded local URL in your browser.
+
+Set up the remote checkout at the path expected by the one-click SSH flow:
+
+```bash
+ssh your-ssh-alias
+git clone https://github.com/KeystoneScience/remote-codex-browser-mirror.git ~/Downloads/pocodex
 cd ~/Downloads/pocodex
 pnpm install --frozen-lockfile
 pnpm run build
-node dist/cli.js --listen 127.0.0.1:8788 --token "$(openssl rand -hex 16)"
+```
 
-# On your local machine
+Manual remote start:
+
+```bash
+ssh your-ssh-alias
+cd ~/Downloads/pocodex
+node dist/cli.js --listen 127.0.0.1:8788 --token "$(openssl rand -hex 16)"
+```
+
+Manual local tunnel:
+
+```bash
 ssh -fN \
   -o ExitOnForwardFailure=yes \
   -o ServerAliveInterval=30 \
@@ -81,30 +108,37 @@ Then open:
 http://127.0.0.1:8789/?token=<remote-token>
 ```
 
-### One-click SSH alias switching
+## One-Click SSH App Server Switching
 
-Open the **App server** button in the Pocodex UI. The **SSH aliases** section reads aliases from the current Pocodex host's `~/.ssh/config`.
+Start the mirror locally, open it in your browser, and click **App server** in the top-right corner.
 
-Clicking an alias will:
+The **SSH aliases** section reads aliases from the local mirror host's `~/.ssh/config`. Clicking an alias will:
 
 - verify the alias exists in SSH config
-- check that the remote has `/Applications/Codex.app`
-- start remote Pocodex in a `tmux` session named `pocodex-remote`
+- check that the remote has Codex installed at `/Applications/Codex.app`
+- start the remote mirror in a `tmux` session named `pocodex-remote`
 - create or reuse a local loopback tunnel
-- switch the current browser to the tunneled URL
-- offer to create a Desktop quick-launch app on macOS
+- switch the browser to the tunneled remote URL
+- ask whether to create a macOS Desktop quick-launch app
 
-For the SSH alias flow, the remote machine should already have this repo built at:
+The remote checkout currently defaults to:
 
 ```text
 ~/Downloads/pocodex
 ```
 
-That keeps the remote startup command simple and avoids exposing Pocodex directly on the LAN. If you want a different remote path, change `REMOTE_POCODEX_DIR` in `src/lib/ssh-app-server.ts`.
+To use another remote path, change `REMOTE_POCODEX_DIR` in `src/lib/ssh-app-server.ts` and rebuild.
 
-### Desktop quick-launch apps
+## Desktop Quick Launchers
 
-When SSH alias switching succeeds on macOS, Pocodex can create a small `.app` on your Desktop. The app reuses the saved alias, token, and local port, starts the remote tmux session if needed, recreates the SSH tunnel if needed, and opens the forwarded Pocodex URL.
+After an SSH alias connection succeeds on macOS, the app can create a Desktop `.app` for that alias. The launcher:
+
+- starts the remote `tmux` mirror session if needed
+- recreates the SSH tunnel if needed
+- opens the tunneled browser URL
+- reuses the saved local port and remote token
+
+Saved launcher state lives in the user's local Application Support directory, not in this repository.
 
 ## CLI
 
@@ -112,75 +146,59 @@ When SSH alias switching succeeds on macOS, Pocodex can create a small `.app` on
 pocodex [--token <secret>] [--app <path>] [--listen 127.0.0.1:8787] [--dev]
 ```
 
-### Flags
+Flags:
 
-- `--token` optional session secret used to authorize the browser session
-- `--app` path to the Codex desktop install root. On macOS this is usually `/Applications/Codex.app`. When running in WSL you can pass either `/mnt/c/Program Files/WindowsApps/OpenAI.Codex_.../app` or the original `C:\Program Files\WindowsApps\OpenAI.Codex_...\app` path.
-- `--listen` host and port to bind, for example `127.0.0.1:8787` or `0.0.0.0:8787`
-- `--dev` watches `src/pocodex.css` and pushes live CSS reload events to the connected browser
+- `--token` optional browser-session secret
+- `--app` path to the Codex desktop install root
+- `--listen` host and port to bind, such as `127.0.0.1:8788` or `0.0.0.0:8788`
+- `--dev` watches `src/pocodex.css` and pushes live CSS reload events to connected browsers
 
-If you expose Pocodex beyond loopback, use a long random token. When configured, the token gates `/session`, and the browser bootstrap stores it in `sessionStorage` so reconnects can work without re-entering it.
-
-When `--app` is omitted, Pocodex auto-detects `/Applications/Codex.app` on macOS or the newest `OpenAI.Codex_*` Windows Store install when running inside WSL.
+When `--app` is omitted, the mirror auto-detects `/Applications/Codex.app` on macOS.
 
 ## How It Works
 
-### 1. Reuse the real Codex UI
+1. The server reads Codex's shipped `app.asar` and serves the real desktop webview.
+2. It patches `index.html` with local CSS, PWA metadata, and a browser bootstrap bridge.
+3. It starts Codex's bundled app server with `codex app-server --listen stdio://`.
+4. It translates browser requests and Codex webview IPC calls into host-side behavior.
+5. It uses bridge calls where possible for plugins, skills, automations, workspace roots, projects, and account state.
+6. The SSH switcher can start another copy of this mirror on a remote host and move the browser to that app server through a local tunnel.
 
-Pocodex reads the shipped `app.asar` from the desktop install and serves those files. The browser is running the real Codex desktop UI, not a reimplementation.
+## Security Model
 
-### 2. Patch the webview entrypoint
+Treat this as a trusted-local or trusted-SSH tool.
 
-Before serving `index.html`, Pocodex injects:
-
-- `pocodex.css`
-- PWA metadata including the web manifest and mobile install hints
-- an inline bootstrap script that installs the browser-side bridge
-- a matching CSP hash so the injected script can run under Codex's content security policy
-
-### 3. Reuse Codex's bundled app server
-
-Pocodex starts the app server shipped inside the desktop install:
-
-```text
-codex app-server --listen stdio://
-```
-
-That process is used as the core agentic harness. Pocodex then bridges the browser session to it.
-
-### 4. Shim the desktop host behavior
-
-Codex's webview expects to live inside Electron with a pile of host APIs behind it. Pocodex provides custom shims for the browser-hosted setup instead:
-
-- terminal sessions are backed by local PTYs via `node-pty`
-- git integration is bridged through the desktop git worker extracted from the Codex bundle
-- browser `vscode://codex/ipc-request` traffic is translated onto Pocodex's host IPC endpoint
-- workspace roots, persisted atoms, and related desktop state are mirrored on the host side
-- automations, plugins, skills, and workspace picker data are read through the app-server bridge where possible
-- optional SSH alias switching can start a remote Pocodex instance and tunnel it back to the browser
-- unsupported native features are blocked or stubbed where needed
-
-The shim behavior was derived by treating the shipped and minified `Codex.app` code as the implementation oracle.
-
-### 5. Connect the browser over a host HTTP server
-
-Pocodex creates an HTTP server on the host machine and serves the patched webview from there. The browser loads the UI over HTTP, uses `/ipc-request` for host-style requests, and opens a live WebSocket session on `/session` for bridge traffic and worker messages.
-
-An optional token can gate the browser session. Pocodex supports multiple concurrent browser sessions that share the same backend state.
+- Prefer `127.0.0.1` on remote hosts plus SSH tunnels.
+- Use a long random token whenever the browser session is reachable beyond loopback.
+- Do not expose this directly to the public internet.
+- Any connected browser can drive the Codex session and whatever filesystem, plugins, skills, automations, and desktop capabilities the host allows.
+- Remote Computer Use depends on the remote machine's GUI session and permissions.
 
 ## Current Limitations
 
-- Native desktop behaviors such as notifications, badge updates, context menus, power-save controls, and window mode controls are blocked or stubbed
-- Generic IPC coverage is incomplete; unsupported IPC methods return an error response
-- Streaming fetch is not implemented
-- Personal ChatGPT cloud fetches under `/wham/*` are proxied through managed local auth, but some workspace, billing, and subscription endpoints still return stubs or placeholder data
-- This relies on internal Codex bundle structure and host protocols, so Codex app updates may break assumptions
-- Security is intentionally light; this is suitable for local use and trusted LANs, not public exposure
+- This depends on internal Codex Desktop bundle structure and app-server protocols, so Codex updates can break assumptions.
+- Some native desktop behaviors are blocked or stubbed, including badge updates, some window controls, context menus, notifications, and power-save controls.
+- Generic IPC coverage is incomplete; unsupported IPC methods return an explicit error.
+- Streaming fetch is not implemented.
+- The one-click SSH flow assumes the remote host is already authenticated, has Codex installed, can run `tmux`, and has this repo built at the configured path.
+- This is not an official OpenAI product.
 
-## Contributing
+## Development
 
-Contributor and source-development instructions live in [CONTRIBUTING.md](CONTRIBUTING.md).
+```bash
+pnpm install --frozen-lockfile
+pnpm run build
+pnpm run lint
+pnpm run typecheck
+pnpm exec vitest run test/bootstrap-script.test.ts test/server.test.ts
+```
 
-## Thanks
+Useful dev command:
 
-Thanks to [Ben Allfree](https://github.com/benallfree) for kindly giving this project the `pocodex` npm package name.
+```bash
+pnpm run dev -- --listen 127.0.0.1:8788 --token "$(openssl rand -hex 16)"
+```
+
+## Credits
+
+This is built on top of Pocodex by Dave Jeffery. Thanks to Ben Allfree for the original `pocodex` package-name handoff.

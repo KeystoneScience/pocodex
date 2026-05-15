@@ -1,25 +1,27 @@
 {
   "name": "pocodex",
   "version": "0.4.1",
-  "description": "Serve the real Codex desktop webview in a browser and proxy the host runtime.",
+  "description": "Mirror the real Codex desktop webview in a browser and switch to remote app servers over SSH.",
   "keywords": [
     "browser",
     "cli",
     "codex",
     "macos",
     "openai",
+    "remote",
+    "ssh",
     "wsl"
   ],
-  "homepage": "https://www.pocodex.app",
+  "homepage": "https://github.com/KeystoneScience/remote-codex-browser-mirror",
   "license": "Apache-2.0",
   "author": {
     "name": "Dave Jeffery",
     "email": "dave@davejeffery.com",
-    "url": "https://www.pocodex.app"
+    "url": "https://github.com/davej"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/davej/pocodex"
+    "url": "https://github.com/KeystoneScience/remote-codex-browser-mirror"
   },
   "bin": {
     "pocodex": "./dist/cli.js"
